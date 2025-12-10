@@ -11,7 +11,10 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder, QuantileTransformer
 from dgl.dataloading import MultiLayerFullNeighborSampler
-from dgl.dataloading import NodeDataLoader
+try:
+    from dgl.dataloading import NodeDataLoader
+except ImportError:
+    from dgl.dataloading import DataLoader as NodeDataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 from .gtan_model import GraphAttnModel
 from . import *

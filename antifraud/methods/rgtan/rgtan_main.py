@@ -1,6 +1,9 @@
 import os
 from dgl.dataloading import MultiLayerFullNeighborSampler
-from dgl.dataloading import NodeDataLoader
+try:
+    from dgl.dataloading import NodeDataLoader
+except ImportError:
+    from dgl.dataloading import DataLoader as NodeDataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 import numpy as np
 import pandas as pd

@@ -19,17 +19,7 @@ pip install comet-ml
 
 pip install imbalanced-learn
 
-python - <<EOF
-import torch
-print("Torch CUDA available:", torch.cuda.is_available())
-print("Torch CUDA version:", torch.version.cuda)
-print("Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
-EOF
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 
-python - <<EOF
-import dgl
-import torch
-g = dgl.graph(([0,1],[1,2])).to('cuda' if torch.cuda.is_available() else 'cpu')
-print("DGL backend:", dgl.backend.backend_name)
-print("Graph device:", g.device)
-EOF
+
+python -c "import dgl, torch; g=dgl.graph(([0,1],[1,2])).to('cuda' if torch.cuda.is_available() else 'cpu'); print('DGL backend:', dgl.backend.backend_name); print('Graph device:', g.device)"

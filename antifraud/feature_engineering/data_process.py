@@ -183,169 +183,122 @@ def feat_map():
 
     tensor_list = torch.stack(tensor_list)
     return tensor_list, feat_names
-
-
 if __name__ == "__main__":
 
     set_seed(42)
 
-    # %%
-    """
-        For Yelpchi dataset
-        Code partially from https://github.com/YingtongDou/CARE-GNN
-    """
-    print(f"processing YELP data...")
-    yelp = loadmat(os.path.join(DATADIR, 'YelpChi.mat'))
-    net_rur = yelp['net_rur']
-    net_rtr = yelp['net_rtr']
-    net_rsr = yelp['net_rsr']
-    yelp_homo = yelp['homo']
+    # -------------------------------------------------------------
+    # S-FFSD ONLY: load, feature-engineer, and build graph
+    # -------------------------------------------------------------
+    print("processing S-FFSD data...")
 
-    sparse_to_adjlist(net_rur, os.path.join(
-        DATADIR, "yelp_rur_adjlists.pickle"))
-    sparse_to_adjlist(net_rtr, os.path.join(
-        DATADIR, "yelp_rtr_adjlists.pickle"))
-    sparse_to_adjlist(net_rsr, os.path.join(
-        DATADIR, "yelp_rsr_adjlists.pickle"))
-    sparse_to_adjlist(yelp_homo, os.path.join(
-        DATADIR, "yelp_homo_adjlists.pickle"))
+    sffsd_csv = os.path.join(DATADIR, "S-FFSD.csv")
+    if not os.path.exists(sffsd_csv):
+        raise FileNotFoundError(f"Expected S-FFSD.csv at {sffsd_csv}")
 
-    data_file = yelp
-    labels = pd.DataFrame(data_file['label'].flatten())[0]
-    feat_data = pd.DataFrame(data_file['features'].todense().A)
-    # load the preprocessed adj_lists
-    with open(os.path.join(DATADIR, "yelp_homo_adjlists.pickle"), 'rb') as file:
-        homo = pickle.load(file)
-    file.close()
-    src = []
-    tgt = []
-    for i in homo:
-        for j in homo[i]:
-            src.append(i)
-            tgt.append(j)
-    src = np.array(src)
-    tgt = np.array(tgt)
-    g = dgl.graph((src, tgt))
-    g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
-    g.ndata['feat'] = torch.from_numpy(
-        feat_data.to_numpy()).to(torch.float32)
-    dgl.data.utils.save_graphs(DATADIR + "graph-yelp.bin", [g])
+    # Load base S-FFSD transactions
+    data = pd.read_csv(sffsd_csv)
 
-    # %%
-    """
-        For Amazon dataset
-    """
-    print(f"processing AMAZON data...")
-    amz = loadmat(os.path.join(DATADIR, 'Amazon.mat'))
-    net_upu = amz['net_upu']
-    net_usu = amz['net_usu']
-    net_uvu = amz['net_uvu']
-    amz_homo = amz['homo']
-
-    sparse_to_adjlist(net_upu, os.path.join(
-        DATADIR, "amz_upu_adjlists.pickle"))
-    sparse_to_adjlist(net_usu, os.path.join(
-        DATADIR, "amz_usu_adjlists.pickle"))
-    sparse_to_adjlist(net_uvu, os.path.join(
-        DATADIR, "amz_uvu_adjlists.pickle"))
-    sparse_to_adjlist(amz_homo, os.path.join(
-        DATADIR, "amz_homo_adjlists.pickle"))
-
-    data_file = amz
-    labels = pd.DataFrame(data_file['label'].flatten())[0]
-    feat_data = pd.DataFrame(data_file['features'].todense().A)
-    # load the preprocessed adj_lists
-    with open(DATADIR + 'amz_homo_adjlists.pickle', 'rb') as file:
-        homo = pickle.load(file)
-    file.close()
-    src = []
-    tgt = []
-    for i in homo:
-        for j in homo[i]:
-            src.append(i)
-            tgt.append(j)
-    src = np.array(src)
-    tgt = np.array(tgt)
-    g = dgl.graph((src, tgt))
-    g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
-    g.ndata['feat'] = torch.from_numpy(
-        feat_data.to_numpy()).to(torch.float32)
-    dgl.data.utils.save_graphs(DATADIR + "graph-amazon.bin", [g])
-
-    # # %%
-    # """
-    #     For S-FFSD dataset
-    # """
-    print(f"processing S-FFSD data...")
-    data = pd.read_csv(os.path.join(DATADIR, 'S-FFSD.csv'))
+    # Feature engineering
     data = featmap_gen(data.reset_index(drop=True))
     data.replace(np.nan, 0, inplace=True)
-    data.to_csv(os.path.join(DATADIR, 'S-FFSDneofull.csv'), index=None)
-    data = pd.read_csv(os.path.join(DATADIR, 'S-FFSDneofull.csv'))
 
-    data = data.reset_index(drop=True)
-    out = []
-    alls = []
-    allt = []
+    # Save and reload (keeps behavior close to original)
+    sffsd_neo_csv = os.path.join(DATADIR, "S-FFSDneofull.csv")
+    data.to_csv(sffsd_neo_csv, index=None)
+    data = pd.read_csv(sffsd_neo_csv).reset_index(drop=True)
+
+    # -------------------------------------------------------------
+    # Optimized graph construction for S-FFSD
+    #   - preserves original semantics:
+    #       group by column, sort by Time,
+    #       connect each txn to the next 3 txns in that group
+    #   - avoids slow Python nested loops over rows
+    # -------------------------------------------------------------
+    print("Building S-FFSD graph (optimized)...")
+
     pair = ["Source", "Target", "Location", "Type"]
-    for column in pair:
-        src, tgt = [], []
-        edge_per_trans = 3
-        for c_id, c_df in tqdm(data.groupby(column), desc=column):
-            c_df = c_df.sort_values(by="Time")
-            df_len = len(c_df)
-            sorted_idxs = c_df.index
-            src.extend([sorted_idxs[i] for i in range(df_len)
-                        for j in range(edge_per_trans) if i + j < df_len])
-            tgt.extend([sorted_idxs[i+j] for i in range(df_len)
-                        for j in range(edge_per_trans) if i + j < df_len])
-        alls.extend(src)
-        allt.extend(tgt)
-    alls = np.array(alls)
-    allt = np.array(allt)
-    g = dgl.graph((alls, allt))
+    edge_per_trans = 3
+
+    all_src = []
+    all_dst = []
+
+    # Pre-sort once by Time so each group is time-ordered
+    data_sorted_time = data.sort_values("Time")
+
+    for col in pair:
+        print(f"  processing edges for group: {col}")
+        # group on the column, but keep within-group order by Time
+        for _, gdf in tqdm(data_sorted_time.groupby(col), desc=col):
+            idx = gdf.index.to_numpy()
+            if len(idx) <= 1:
+                continue
+            # connect idx[i] -> idx[i+1], idx[i+2], ... up to edge_per_trans
+            for j in range(1, edge_per_trans + 1):
+                if len(idx) > j:
+                    src = idx[:-j]
+                    dst = idx[j:]
+                    all_src.append(src)
+                    all_dst.append(dst)
+
+    if len(all_src) == 0:
+        raise RuntimeError("No edges were created for S-FFSD graph; check your data distribution.")
+
+    all_src = np.concatenate(all_src)
+    all_dst = np.concatenate(all_dst)
+
+    g = dgl.graph((all_src, all_dst))
+
+    # Encode categorical columns and attach node features / labels
     cal_list = ["Source", "Target", "Location", "Type"]
     for col in cal_list:
         le = LabelEncoder()
         data[col] = le.fit_transform(data[col].apply(str).values)
+
     feat_data = data.drop("Labels", axis=1)
     labels = data["Labels"]
-    g.ndata['label'] = torch.from_numpy(
-        labels.to_numpy()).to(torch.long)
-    g.ndata['feat'] = torch.from_numpy(
-        feat_data.to_numpy()).to(torch.float32)
-    dgl.data.utils.save_graphs(DATADIR + "graph-S-FFSD.bin", [g])
 
-    # generate neighbor riskstat features
-    for file_name in ['S-FFSD', 'yelp', 'amazon']:
-        print(
-            f"Generating neighbor risk-aware features for {file_name} dataset...")
-        graph = dgl.load_graphs(DATADIR + "graph-" + file_name + ".bin")[0][0]
-        graph: dgl.DGLGraph
-        print(f"graph info: {graph}")
+    g.ndata["label"] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+    g.ndata["feat"] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
-        edge_feat: torch.Tensor
-        degree_feat = graph.in_degrees().unsqueeze_(1).float()
-        risk_feat = count_risk_neighs(graph).unsqueeze_(1).float()
+    graph_bin_path = os.path.join(DATADIR, "graph-S-FFSD.bin")
+    dgl.data.utils.save_graphs(graph_bin_path, [g])
 
-        origin_feat_name = []
-        edge_feat = torch.cat([degree_feat, risk_feat], dim=1)
-        origin_feat_name = ['degree', 'riskstat']
+    # -------------------------------------------------------------
+    # Neighbor risk-aware feature generation for S-FFSD ONLY
+    # -------------------------------------------------------------
+    print("Generating neighbor risk-aware features for S-FFSD dataset...")
 
-        features_neigh, feat_names = feat_map()
-        # print(f"feature neigh: {features_neigh.shape}")
+    graph = dgl.load_graphs(graph_bin_path)[0][0]
+    graph: dgl.DGLGraph
+    print(f"graph info: {graph}")
 
-        features_neigh = torch.cat(
-            (edge_feat, features_neigh), dim=1
-        ).numpy()
-        feat_names = origin_feat_name + feat_names
-        features_neigh[np.isnan(features_neigh)] = 0.
+    # Base edge features: in-degree + count of risky neighbors
+    degree_feat = graph.in_degrees().unsqueeze_(1).float()
+    risk_feat = count_risk_neighs(graph).unsqueeze_(1).float()
 
-        output_path = DATADIR + file_name + "_neigh_feat.csv"
-        features_neigh = pd.DataFrame(features_neigh, columns=feat_names)
-        scaler = StandardScaler()
-        # features_neigh = np.log(features_neigh + 1)
-        features_neigh = pd.DataFrame(scaler.fit_transform(
-            features_neigh), columns=features_neigh.columns)
+    origin_feat_name = ["degree", "riskstat"]
+    edge_feat = torch.cat([degree_feat, risk_feat], dim=1)
 
-        features_neigh.to_csv(output_path, index=False)
+    # expose to feat_map() via globals (as in original code)
+    globals()["graph"] = graph
+    globals()["edge_feat"] = edge_feat
+
+    # Higher-order neighbor statistics
+    features_neigh, feat_names = feat_map()
+    features_neigh = torch.cat((edge_feat, features_neigh), dim=1).numpy()
+    feat_names = origin_feat_name + feat_names
+    features_neigh[np.isnan(features_neigh)] = 0.0
+
+    # Scale and save neighbor features
+    output_path = os.path.join(DATADIR, "S-FFSD_neigh_feat.csv")
+    features_neigh_df = pd.DataFrame(features_neigh, columns=feat_names)
+    scaler = StandardScaler()
+    features_neigh_df = pd.DataFrame(
+        scaler.fit_transform(features_neigh_df),
+        columns=features_neigh_df.columns,
+    )
+    features_neigh_df.to_csv(output_path, index=False)
+
+    print(f"Done. Neighbor features written to: {output_path}")
+
