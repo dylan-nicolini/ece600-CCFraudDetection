@@ -4,7 +4,7 @@ lr: 0.003
 wd: !!float 1e-4
 n_layers: 2
 dropout: [0.2, 0.1]
-device: "cuda:0"
+device: "cpu"
 early_stopping: 10
 n_fold: 5
 seed: 2023
