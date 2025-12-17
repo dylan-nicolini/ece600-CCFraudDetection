@@ -1,0 +1,1 @@
+ ssh -i "C:\Users\DylanNicolini\Downloads\terraform\ece-600-key.pem" ubuntu@3.88.172.51
