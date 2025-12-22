@@ -279,76 +279,74 @@ class Tabular1DCNN2(nn.Module):
 
 
 class TransEmbedding(nn.Module):
+    """
+    Embeds categorical features + (optional) neighbor-stat features.
+
+    IEEE-safe changes:
+      - Always builds a stable list self.cat_cols
+      - Always builds forward_mlp sized to self.cat_cols
+      - forward() never assumes forward_mlp exists
+      - neighbor-stat path is skipped cleanly when empty/missing
+    """
 
     def __init__(
         self,
         df=None,
-        device='cpu',
+        device="cpu",
         dropout=0.2,
         in_feats_dim=82,
         cat_features=None,
         neigh_features=None,
         att_head_num: int = 4,
-        neighstat_uni_dim=64
+        neighstat_uni_dim=64,
     ):
-        """
-        Initialize the attribute embedding and feature learning component
-        :param df: the pandas dataframe
-        :param device: where to train model
-        :param dropout: the dropout rate
-        :param in_feats_dim: embedding dim
-        :param cat_features: categorical feature dict/list
-        :param neigh_features: neighbor stat dict (may be empty for IEEE)
-        :param att_head_num: attention head number for riskstat embeddings
-        """
-        super(TransEmbedding, self).__init__()
+        super().__init__()
+
+        if cat_features is None:
+            cat_features = []
+
+        # Stable ordering for categorical columns (and remove special fields)
+        self.cat_cols = [c for c in list(cat_features) if c not in {"Labels", "Time"}]
+
         self.time_pe = PosEncoding(dim=in_feats_dim, device=device, base=100)
 
-        self.cat_table = nn.ModuleDict({
-            col: nn.Embedding(max(df[col].unique()) + 1, in_feats_dim).to(device)
-            for col in cat_features if col not in {"Labels", "Time"}
-        })
+        # Embedding tables for categorical cols
+        self.cat_table = nn.ModuleDict()
+        for col in self.cat_cols:
+            # df[col] must be integer-encoded already (LabelEncoder in your loader)
+            # +1 for max id
+            max_id = int(df[col].max()) if df is not None and col in df.columns else 0
+            self.cat_table[col] = nn.Embedding(max_id + 1, in_feats_dim).to(device)
 
-        # ✅ IEEE patch: only build neighbor-stat CNN if dict is non-empty
+        # Optional neighbor-stat CNN table (only if dict is non-empty)
         self.nei_table = None
         if isinstance(neigh_features, dict) and len(neigh_features) > 0:
             self.nei_table = Tabular1DCNN2(input_dim=len(neigh_features), embed_dim=in_feats_dim)
 
+        # Attention bits used by neighbor-stat embedding path
         self.att_head_num = att_head_num
         self.att_head_size = int(in_feats_dim / att_head_num)
         self.total_head_size = in_feats_dim
+
         self.lin_q = nn.Linear(in_feats_dim, self.total_head_size)
         self.lin_k = nn.Linear(in_feats_dim, self.total_head_size)
         self.lin_v = nn.Linear(in_feats_dim, self.total_head_size)
-
         self.lin_final = nn.Linear(in_feats_dim, in_feats_dim)
         self.layer_norm = nn.LayerNorm(in_feats_dim, eps=1e-8)
 
+        # Output heads
         self.neigh_mlp = nn.Linear(in_feats_dim, 1)
 
-        self.neigh_add_mlp = nn.ModuleList([nn.Linear(in_feats_dim, in_feats_dim) for _ in range(
-            len(neigh_features.columns))]) if isinstance(neigh_features, pd.DataFrame) else None
+        # ✅ Always build forward_mlp sized to cat_cols (never None)
+        self.forward_mlp = nn.ModuleList([nn.Linear(in_feats_dim, in_feats_dim) for _ in range(len(self.cat_cols))])
 
-        self.label_table = nn.Embedding(3, in_feats_dim, padding_idx=2).to(device)
-        self.time_emb = None
-        self.emb_dict = None
-        self.label_emb = None
-        self.cat_features = cat_features
-        self.neigh_features = neigh_features
-
-        # keep the existing behavior, but guard at call site
-        self.forward_mlp = nn.ModuleList(
-            [nn.Linear(in_feats_dim, in_feats_dim) for _ in range(len(cat_features))]
-        )
         self.dropout = nn.Dropout(dropout)
 
-    def forward_emb(self, cat_feat):
-        if self.emb_dict is None:
-            self.emb_dict = self.cat_table
-        support = {
-            col: self.emb_dict[col](cat_feat[col])
-            for col in self.cat_features if col not in {"Labels", "Time"}
-        }
+    def forward_emb(self, cat_feat: dict):
+        support = {}
+        for col in self.cat_cols:
+            # cat_feat[col] is expected to be LongTensor ids
+            support[col] = self.cat_table[col](cat_feat[col])
         return support
 
     def transpose_for_scores(self, input_tensor):
@@ -356,18 +354,15 @@ class TransEmbedding(nn.Module):
         input_tensor = input_tensor.view(*new_x_shape)
         return input_tensor.permute(0, 2, 1, 3)
 
-    def forward_neigh_emb(self, neighstat_feat):
-        # ✅ IEEE patch: neighbor-stat features may be missing/empty
+    def forward_neigh_emb(self, neighstat_feat: dict):
+        # Skip if no neighbor stats
         if (neighstat_feat is None) or (not isinstance(neighstat_feat, dict)) or (len(neighstat_feat) == 0) or (self.nei_table is None):
             return None, []
 
-        cols = neighstat_feat.keys()
-        tensor_list = []
-        for col in cols:
-            tensor_list.append(neighstat_feat[col])
+        cols = list(neighstat_feat.keys())
+        tensor_list = [neighstat_feat[c] for c in cols]  # each is (B,)
+        neis = torch.stack(tensor_list).T  # (B, num_cols)
 
-        # (B, num_cols)
-        neis = torch.stack(tensor_list).T
         input_tensor = self.nei_table(neis)
 
         mixed_q_layer = self.lin_q(input_tensor)
@@ -386,29 +381,29 @@ class TransEmbedding(nn.Module):
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_shape = context_layer.size()[:-2] + (self.total_head_size,)
         context_layer = context_layer.view(*new_context_shape)
+
         hidden_states = self.lin_final(context_layer)
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states, cols
 
     def forward(self, cat_feat: dict, neighstat_feat: dict):
         support = self.forward_emb(cat_feat)
+
         cat_output = 0
+        for i, col in enumerate(self.cat_cols):
+            x = support[col]
+            x = self.dropout(x)
+            # ✅ forward_mlp is always present and aligned to cat_cols
+            x = self.forward_mlp[i](x)
+            cat_output = cat_output + x
+
         nei_output = 0
-
-        for i, k in enumerate(support.keys()):
-            support[k] = self.dropout(support[k])
-            if self.forward_mlp is not None and i < len(self.forward_mlp):
-                support[k] = self.forward_mlp[i](support[k])
-            cat_output = cat_output + support[k]
-
-        # ✅ IEEE patch: only use neighbor branch if dict non-empty + nei_table exists
         if (neighstat_feat is not None) and isinstance(neighstat_feat, dict) and (len(neighstat_feat) > 0) and (self.nei_table is not None):
-            nei_embs, cols_list = self.forward_neigh_emb(neighstat_feat)
+            nei_embs, _ = self.forward_neigh_emb(neighstat_feat)
             if nei_embs is not None:
                 nei_output = self.neigh_mlp(nei_embs).squeeze(-1)
 
         return cat_output, nei_output
-
 
 class RGTAN(nn.Module):
 
