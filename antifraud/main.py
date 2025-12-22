@@ -244,24 +244,19 @@ def main(args):
 
         elif args["method"] == "rgtan":
             from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
+
             feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
                 args["dataset"], args["test_size"]
             )
 
-            # ✅ Pass Comet experiment if rgtan_main supports it; else fall back.
-            try:
-                rgtan_main(
-                    feat_data, g, train_idx, test_idx, labels, args,
-                    cat_features, neigh_features,
-                    nei_att_head=args["nei_att_heads"][args["dataset"]],
-                    experiment=experiment
-                )
-            except TypeError:
-                rgtan_main(
-                    feat_data, g, train_idx, test_idx, labels, args,
-                    cat_features, neigh_features,
-                    nei_att_head=args["nei_att_heads"][args["dataset"]]
-                )
+            # Enforce GTAN-standard Comet logging for RGTAN (no silent fallback)
+            rgtan_main(
+                feat_data, g, train_idx, test_idx, labels, args,
+                cat_features, neigh_features,
+                nei_att_head=args["nei_att_heads"][args["dataset"]],
+                experiment=experiment
+            )
+
 
         elif args["method"] == "hogrl":
             from methods.hogrl.hogrl_main import hogrl_main
