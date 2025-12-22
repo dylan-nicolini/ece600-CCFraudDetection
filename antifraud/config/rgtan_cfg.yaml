@@ -16,3 +16,4 @@ nei_att_heads:
     yelp: 4
     amazon: 5
     S-FFSD: 9
+    ieee: 9
