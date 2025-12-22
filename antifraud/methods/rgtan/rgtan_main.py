@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.optim as optim
 import dgl
 import pickle
+import os
+import zipfile
 
 from tqdm import tqdm
 from scipy.io import loadmat
@@ -32,12 +34,7 @@ except Exception:
     Experiment = None
 
 
-def _comet_log_metric(experiment, name: str, value, step=None, *, silent: bool = False):
-    """Log a numeric metric to Comet with optional step.
-
-    We do NOT fully swallow failures by default, because silent failures are
-    exactly what makes RGTAN appear to have 'blank' metrics in Comet.
-    """
+def _log_metric(experiment, name: str, value, step=None):
     if experiment is None:
         return
     try:
@@ -45,22 +42,11 @@ def _comet_log_metric(experiment, name: str, value, step=None, *, silent: bool =
             experiment.log_metric(name, float(value))
         else:
             experiment.log_metric(name, float(value), step=int(step))
-    except Exception as e:
-        if not silent:
-            print(f"[RGTAN] Comet log_metric failed: {name}={value} step={step} err={repr(e)}", flush=True)
+    except Exception:
+        pass
 
 
-def _comet_log_other(experiment, name: str, value, *, silent: bool = True):
-    if experiment is None:
-        return
-    try:
-        experiment.log_other(name, value)
-    except Exception as e:
-        if not silent:
-            print(f"[RGTAN] Comet log_other failed: {name}={value} err={repr(e)}", flush=True)
-
-
-def _comet_log_parameters_once(experiment, args, nei_att_head):
+def _log_params_once(experiment, args, nei_att_head):
     if experiment is None:
         return
     try:
@@ -82,9 +68,8 @@ def _comet_log_parameters_once(experiment, args, nei_att_head):
             "test_size": args.get("test_size"),
             "nei_att_head": nei_att_head,
         })
-    except Exception as e:
-        # Parameters are non-critical; keep silent unless debugging.
-        print(f"[RGTAN] Comet log_parameters failed: {repr(e)}", flush=True)
+    except Exception:
+        pass
 
 
 def _safe_auc(y_true, y_score):
@@ -95,6 +80,117 @@ def _safe_auc(y_true, y_score):
         return float(roc_auc_score(y_true, y_score))
     except Exception:
         return float("nan")
+
+
+def _find_ieee_files(prefix_dir: str):
+    """
+    Locate IEEE-CIS files in common layouts.
+
+    Supported:
+      - data/train_transaction.csv + data/train_identity.csv
+      - data/IEEE/train_transaction.csv + data/IEEE/train_identity.csv
+      - data/ieee/train_transaction.csv + data/ieee/train_identity.csv
+      - data/ieee-fraud-detection/train_transaction.csv + train_identity.csv
+    """
+    candidates = [
+        (os.path.join(prefix_dir, "train_transaction.csv"), os.path.join(prefix_dir, "train_identity.csv")),
+        (os.path.join(prefix_dir, "IEEE", "train_transaction.csv"), os.path.join(prefix_dir, "IEEE", "train_identity.csv")),
+        (os.path.join(prefix_dir, "ieee", "train_transaction.csv"), os.path.join(prefix_dir, "ieee", "train_identity.csv")),
+        (os.path.join(prefix_dir, "ieee-fraud-detection", "train_transaction.csv"),
+         os.path.join(prefix_dir, "ieee-fraud-detection", "train_identity.csv")),
+    ]
+    for tx_path, id_path in candidates:
+        if os.path.exists(tx_path):
+            # identity file might be missing; allow tx-only
+            return tx_path, (id_path if os.path.exists(id_path) else None)
+    return None, None
+
+
+def _read_ieee_from_zip(zip_path: str):
+    """
+    Read IEEE-CIS CSVs from a zip file without extracting.
+    """
+    with zipfile.ZipFile(zip_path, "r") as z:
+        names = z.namelist()
+        tx_name = None
+        id_name = None
+        for n in names:
+            if n.endswith("train_transaction.csv"):
+                tx_name = n
+            elif n.endswith("train_identity.csv"):
+                id_name = n
+
+        if tx_name is None:
+            raise FileNotFoundError("train_transaction.csv not found inside zip")
+
+        with z.open(tx_name) as f:
+            tx = pd.read_csv(f)
+
+        identity = None
+        if id_name is not None:
+            with z.open(id_name) as f:
+                identity = pd.read_csv(f)
+
+    return tx, identity
+
+
+def _build_ieee_graph(df: pd.DataFrame,
+                      time_col: str = "TransactionDT",
+                      edge_per_trans: int = 3,
+                      max_group_size: int = 5000):
+    """
+    Build a transaction graph for IEEE by connecting transactions that share an entity value,
+    ordered by TransactionDT. We cap very large entity groups to avoid edge explosions.
+    """
+    if time_col not in df.columns:
+        raise ValueError(f"IEEE dataframe missing required time column: {time_col}")
+
+    # Candidate entity columns commonly present in IEEE-CIS
+    entity_cols = [
+        # cards / address
+        "card1", "card2", "card3", "card4", "card5", "card6",
+        "addr1", "addr2",
+        # emails
+        "P_emaildomain", "R_emaildomain",
+        # device info (from identity)
+        "DeviceType", "DeviceInfo",
+    ]
+    entity_cols = [c for c in entity_cols if c in df.columns]
+
+    alls = []
+    allt = []
+
+    df = df.reset_index(drop=True)
+
+    for col in entity_cols:
+        src, tgt = [], []
+        for _, gdf in df.groupby(col, dropna=True):
+            if len(gdf) < 2:
+                continue
+            if len(gdf) > max_group_size:
+                gdf = gdf.sample(n=max_group_size, random_state=42)
+            gdf = gdf.sort_values(by=time_col)
+            sorted_idxs = gdf.index.to_list()
+            df_len = len(sorted_idxs)
+            for i in range(df_len):
+                for j in range(1, edge_per_trans + 1):
+                    if i + j < df_len:
+                        src.append(sorted_idxs[i])
+                        tgt.append(sorted_idxs[i + j])
+        if len(src) > 0:
+            alls.extend(src)
+            allt.extend(tgt)
+
+    if len(alls) == 0:
+        # fallback: chain by time
+        gdf = df.sort_values(by=time_col)
+        idxs = gdf.index.to_list()
+        for i in range(len(idxs) - 1):
+            alls.append(idxs[i])
+            allt.append(idxs[i + 1])
+
+    g = dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(df))
+    return g, entity_cols
 
 
 def rgtan_main(
@@ -142,7 +238,7 @@ def rgtan_main(
     device = args["device"]
     graph = graph.to(device)
 
-    _comet_log_parameters_once(experiment, args, nei_att_head)
+    _log_params_once(experiment, args, nei_att_head)
 
     # Buffers for OOF and test predictions
     oof_predictions = torch.from_numpy(np.zeros([len(feat_df), 2])).float().to(device)
@@ -174,7 +270,6 @@ def rgtan_main(
 
     for fold, (trn_idx, val_idx) in enumerate(kfold.split(feat_df.iloc[train_idx], y_target)):
         print(f"Training fold {fold + 1}", flush=True)
-        _comet_log_other(experiment, "fold", fold + 1, silent=False)
 
         trn_ind = torch.from_numpy(np.array(train_idx)[trn_idx]).long().to(device)
         val_ind = torch.from_numpy(np.array(train_idx)[val_idx]).long().to(device)
@@ -225,7 +320,6 @@ def rgtan_main(
 
         # Optim
         lr = args["lr"] * np.sqrt(args["batch_size"] / 1024)
-        _comet_log_other(experiment, "lr_scaled", float(lr), silent=False)
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args["wd"])
         lr_scheduler = MultiStepLR(optimizer=optimizer, milestones=[4000, 12000], gamma=0.3)
 
@@ -351,17 +445,15 @@ def rgtan_main(
             val_auc_epoch = _safe_auc(val_labels_np, val_scores)
 
             # -----------------------
-            # Comet: GTAN-standard per-epoch logging (step=epoch)
-            # (Direct + non-silent failure reporting)
+            # Comet: per-epoch logging (step=epoch)
             # -----------------------
-            _comet_log_metric(experiment, "train_loss", train_loss_epoch, step=epoch, silent=False)
-            _comet_log_metric(experiment, "val_loss", val_loss_epoch, step=epoch, silent=False)
-            _comet_log_metric(experiment, "val_ap", val_ap_epoch, step=epoch, silent=False)
-            _comet_log_metric(experiment, "val_auc", val_auc_epoch, step=epoch, silent=False)
-            _comet_log_metric(experiment, "epoch_alive", 1.0, step=epoch, silent=True)
+            _log_metric(experiment, "train_loss", train_loss_epoch, step=epoch)
+            _log_metric(experiment, "val_loss", val_loss_epoch, step=epoch)
+            _log_metric(experiment, "val_ap", val_ap_epoch, step=epoch)
+            _log_metric(experiment, "val_auc", val_auc_epoch, step=epoch)
 
-            # Early stopping uses val_loss (same idea as original / GTAN)
-            earlystoper.earlystop(val_loss_epoch, model)
+            # Early stopping uses val_loss (same idea as original)
+            earlystoper.earlystop(torch.tensor(val_loss_epoch).to(device), model)
             if earlystoper.is_earlystop:
                 print("Early Stopping!", flush=True)
                 break
@@ -427,14 +519,14 @@ def rgtan_main(
     print("test f1:", test_f1, flush=True)
     print("test AP:", test_ap, flush=True)
 
-    _comet_log_metric(experiment, "oof_ap", my_ap, silent=False)
-    _comet_log_metric(experiment, "test_auc", test_auc, silent=False)
-    _comet_log_metric(experiment, "test_f1", test_f1, silent=False)
-    _comet_log_metric(experiment, "test_ap", test_ap, silent=False)
+    _log_metric(experiment, "oof_ap", my_ap)
+    _log_metric(experiment, "test_auc", test_auc)
+    _log_metric(experiment, "test_f1", test_f1)
+    _log_metric(experiment, "test_ap", test_ap)
 
 
 def loda_rgtan_data(dataset: str, test_size: float):
-    prefix = "data/"
+    prefix = os.path.join(os.path.dirname(__file__), "..", "..", "data/")
 
     if dataset == 'S-FFSD':
         cat_features = ["Target", "Location", "Type"]
@@ -489,6 +581,96 @@ def loda_rgtan_data(dataset: str, test_size: float):
         feat_neigh = pd.read_csv(prefix + "S-FFSD_neigh_feat.csv")
         print("neighborhood feature loaded for nn input.", flush=True)
         neigh_features = feat_neigh
+
+    elif dataset in ("IEEE", "IEEE-CIS", "ieee", "ieeecis"):
+        # -----------------------
+        # IEEE-CIS Fraud Detection (Kaggle)
+        # -----------------------
+        cat_features = []
+        neigh_features = []
+
+        zip_path = os.path.join(prefix, "ieee-fraud-detection.zip")
+        tx_path, id_path = _find_ieee_files(prefix)
+
+        if os.path.exists(zip_path):
+            tx, identity = _read_ieee_from_zip(zip_path)
+        elif tx_path is not None:
+            tx = pd.read_csv(tx_path)
+            identity = pd.read_csv(id_path) if id_path is not None else None
+        else:
+            raise FileNotFoundError(
+                "IEEE dataset not found. Place either:\n"
+                f"  - {zip_path}\n"
+                "  - data/train_transaction.csv (+ train_identity.csv)\n"
+                "  - data/IEEE/train_transaction.csv (+ train_identity.csv)\n"
+            )
+
+        # merge identity if present
+        if identity is not None and "TransactionID" in tx.columns and "TransactionID" in identity.columns:
+            df = tx.merge(identity, on="TransactionID", how="left")
+        else:
+            df = tx.copy()
+
+        if "isFraud" not in df.columns:
+            raise ValueError("IEEE train_transaction.csv must include 'isFraud' column")
+
+        labels = df["isFraud"].astype(int)
+
+        # drop obvious non-features
+        drop_cols = []
+        for c in ["TransactionID"]:
+            if c in df.columns:
+                drop_cols.append(c)
+
+        feat_df = df.drop(columns=drop_cols)
+
+        # Build graph
+        g, used_entity_cols = _build_ieee_graph(
+            feat_df, time_col="TransactionDT", edge_per_trans=3, max_group_size=5000
+        )
+
+        # Identify categorical columns (object)
+        obj_cols = [c for c in feat_df.columns if feat_df[c].dtype == "object"]
+        for col in obj_cols:
+            le = LabelEncoder()
+            feat_df[col] = le.fit_transform(feat_df[col].astype(str).fillna("NA").values)
+            cat_features.append(col)
+
+        # Fill numeric NaNs
+        for col in feat_df.columns:
+            if col in cat_features:
+                feat_df[col] = feat_df[col].fillna(0).astype(int)
+            else:
+                if pd.api.types.is_numeric_dtype(feat_df[col]):
+                    med = feat_df[col].median()
+                    if pd.isna(med):
+                        med = 0.0
+                    feat_df[col] = feat_df[col].fillna(med)
+                else:
+                    feat_df[col] = feat_df[col].fillna(0)
+
+        # assign node data
+        g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+        g.ndata['feat'] = torch.from_numpy(feat_df.to_numpy()).to(torch.float32)
+
+        # save graph for reuse
+        graph_path = os.path.join(prefix, "graph-{}.bin".format("IEEE"))
+        try:
+            dgl.data.utils.save_graphs(graph_path, [g])
+        except Exception:
+            pass
+
+        index = list(range(len(labels)))
+        train_idx, test_idx, _, _ = train_test_split(
+            index, labels, stratify=labels, test_size=test_size,
+            random_state=2, shuffle=True
+        )
+
+        feat_data = feat_df
+
+        # NOTE: RGTAN "neigh_features" is optional; for IEEE we return [] by default.
+        # If you later generate neighbor-stat features (e.g., per-entity aggregates),
+        # load them here as a DataFrame with matching row count.
 
     elif dataset == 'yelp':
         cat_features = []
