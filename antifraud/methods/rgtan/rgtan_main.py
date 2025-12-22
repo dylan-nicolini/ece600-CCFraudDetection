@@ -1,12 +1,12 @@
+import os
+import zipfile
+import pickle
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import dgl
-import pickle
-import os
-import zipfile
 
 from tqdm import tqdm
 from scipy.io import loadmat
@@ -32,6 +32,34 @@ try:
     from comet_ml import Experiment
 except Exception:
     Experiment = None
+
+
+# -------------------------
+# Utilities
+# -------------------------
+def _ensure_self_loops(g: dgl.DGLGraph) -> dgl.DGLGraph:
+    """
+    Option A fix for DGL zero-in-degree nodes:
+    remove existing self-loops (if any), then add self-loops for all nodes.
+    """
+    try:
+        g = dgl.remove_self_loop(g)
+    except Exception:
+        pass
+    try:
+        g = dgl.add_self_loop(g)
+    except Exception:
+        pass
+    return g
+
+
+def _safe_auc(y_true, y_score):
+    try:
+        if len(np.unique(y_true)) < 2:
+            return float("nan")
+        return float(roc_auc_score(y_true, y_score))
+    except Exception:
+        return float("nan")
 
 
 def _log_metric(experiment, name: str, value, step=None):
@@ -72,16 +100,19 @@ def _log_params_once(experiment, args, nei_att_head):
         pass
 
 
-def _safe_auc(y_true, y_score):
-    # AUC only valid if both classes exist
+def _maybe_flush(experiment):
+    if experiment is None:
+        return
     try:
-        if len(np.unique(y_true)) < 2:
-            return float("nan")
-        return float(roc_auc_score(y_true, y_score))
+        if hasattr(experiment, "flush"):
+            experiment.flush()
     except Exception:
-        return float("nan")
+        pass
 
 
+# -------------------------
+# IEEE helpers
+# -------------------------
 def _find_ieee_files(prefix_dir: str):
     """
     Locate IEEE-CIS files in common layouts.
@@ -101,7 +132,6 @@ def _find_ieee_files(prefix_dir: str):
     ]
     for tx_path, id_path in candidates:
         if os.path.exists(tx_path):
-            # identity file might be missing; allow tx-only
             return tx_path, (id_path if os.path.exists(id_path) else None)
     return None, None
 
@@ -140,26 +170,20 @@ def _build_ieee_graph(df: pd.DataFrame,
                       max_group_size: int = 5000):
     """
     Build a transaction graph for IEEE by connecting transactions that share an entity value,
-    ordered by TransactionDT. We cap very large entity groups to avoid edge explosions.
+    ordered by TransactionDT. Caps large groups to avoid edge explosion.
     """
     if time_col not in df.columns:
         raise ValueError(f"IEEE dataframe missing required time column: {time_col}")
 
-    # Candidate entity columns commonly present in IEEE-CIS
     entity_cols = [
-        # cards / address
         "card1", "card2", "card3", "card4", "card5", "card6",
         "addr1", "addr2",
-        # emails
         "P_emaildomain", "R_emaildomain",
-        # device info (from identity)
         "DeviceType", "DeviceInfo",
     ]
     entity_cols = [c for c in entity_cols if c in df.columns]
 
-    alls = []
-    allt = []
-
+    alls, allt = [], []
     df = df.reset_index(drop=True)
 
     for col in entity_cols:
@@ -171,18 +195,19 @@ def _build_ieee_graph(df: pd.DataFrame,
                 gdf = gdf.sample(n=max_group_size, random_state=42)
             gdf = gdf.sort_values(by=time_col)
             sorted_idxs = gdf.index.to_list()
-            df_len = len(sorted_idxs)
-            for i in range(df_len):
+            n = len(sorted_idxs)
+            for i in range(n):
                 for j in range(1, edge_per_trans + 1):
-                    if i + j < df_len:
+                    if i + j < n:
                         src.append(sorted_idxs[i])
                         tgt.append(sorted_idxs[i + j])
-        if len(src) > 0:
+
+        if src:
             alls.extend(src)
             allt.extend(tgt)
 
+    # fallback: chain by time if no edges
     if len(alls) == 0:
-        # fallback: chain by time
         gdf = df.sort_values(by=time_col)
         idxs = gdf.index.to_list()
         for i in range(len(idxs) - 1):
@@ -193,6 +218,9 @@ def _build_ieee_graph(df: pd.DataFrame,
     return g, entity_cols
 
 
+# -------------------------
+# Training
+# -------------------------
 def rgtan_main(
     feat_df,
     graph,
@@ -205,35 +233,8 @@ def rgtan_main(
     nei_att_head,
     experiment: Experiment = None
 ):
-    print(f"[RGTAN] Comet experiment is None? {experiment is None}", flush=True)
-
-    if experiment is not None:
-        try:
-            print(f"[RGTAN] Comet experiment disabled? {getattr(experiment, 'disabled', 'unknown')}", flush=True)
-            experiment.log_other("rgtan_alive", True)
-            experiment.log_metric("rgtan_heartbeat", 1.0)
-            print("[RGTAN] Wrote rgtan_alive + rgtan_heartbeat to Comet", flush=True)
-        except Exception as e:
-            print(f"[RGTAN] Comet logging ERROR: {repr(e)}", flush=True)
-
     """
-    RGTAN with GTAN-standard logging:
-
-    Console (every 10 batches):
-      - In epoch|batch ... train_loss, train_ap, train_acc, train_auc
-      - In epoch|batch ... val_loss, val_ap, val_acc, val_auc
-
-    Comet per epoch (step=epoch):
-      - train_loss
-      - val_loss
-      - val_ap
-      - val_auc
-
-    Comet final:
-      - oof_ap
-      - test_auc
-      - test_f1
-      - test_ap
+    RGTAN training loop with GTAN-style console logging and Comet epoch metrics.
     """
     device = args["device"]
     graph = graph.to(device)
@@ -269,7 +270,8 @@ def rgtan_main(
     loss_fn = nn.CrossEntropyLoss().to(device)
 
     for fold, (trn_idx, val_idx) in enumerate(kfold.split(feat_df.iloc[train_idx], y_target)):
-        print(f"Training fold {fold + 1}", flush=True)
+        fold_no = fold + 1
+        print(f"Training fold {fold_no}", flush=True)
 
         trn_ind = torch.from_numpy(np.array(train_idx)[trn_idx]).long().to(device)
         val_ind = torch.from_numpy(np.array(train_idx)[val_idx]).long().to(device)
@@ -355,22 +357,20 @@ def rgtan_main(
 
                 train_loss_list.append(float(train_loss.detach().cpu().numpy()))
 
-                # GTAN-style console output
                 if step % 10 == 0:
                     try:
-                        tr_batch_pred = (
+                        tr_acc = (
                             torch.sum(torch.argmax(logits_.detach(), dim=1) == batch_labels_) / batch_labels_.shape[0]
                         )
                         score = torch.softmax(logits_.detach(), dim=1)[:, 1].cpu().numpy()
                         yb = batch_labels_.cpu().numpy()
-
                         print(
                             "In epoch:{:03d}|batch:{:04d}, train_loss:{:4f}, train_ap:{:.4f}, train_acc:{:.4f}, train_auc:{:.4f}".format(
                                 epoch,
                                 step,
                                 float(np.mean(train_loss_list)),
                                 float(average_precision_score(yb, score)),
-                                float(tr_batch_pred.detach().cpu().numpy()),
+                                float(tr_acc.detach().cpu().numpy()),
                                 _safe_auc(yb, score),
                             ),
                             flush=True
@@ -397,7 +397,6 @@ def rgtan_main(
                     blocks = [b.to(device) for b in blocks]
                     val_logits = model(blocks, batch_inputs, lpa_labels, batch_work_inputs, batch_neighstat_inputs)
 
-                    # store for full val metrics
                     oof_predictions[seeds] = val_logits
 
                     mask = batch_labels == 2
@@ -412,19 +411,18 @@ def rgtan_main(
 
                     if step % 10 == 0:
                         try:
-                            val_batch_pred = (
+                            val_acc = (
                                 torch.sum(torch.argmax(val_logits_.detach(), dim=1) == batch_labels_) / batch_labels_.shape[0]
                             )
                             score = torch.softmax(val_logits_.detach(), dim=1)[:, 1].cpu().numpy()
                             yb = batch_labels_.cpu().numpy()
-
                             print(
                                 "In epoch:{:03d}|batch:{:04d}, val_loss:{:4f}, val_ap:{:.4f}, val_acc:{:.4f}, val_auc:{:.4f}".format(
                                     epoch,
                                     step,
                                     float(val_loss_sum / max(val_count, 1)),
                                     float(average_precision_score(yb, score)),
-                                    float(val_batch_pred.detach().cpu().numpy()),
+                                    float(val_acc.detach().cpu().numpy()),
                                     _safe_auc(yb, score),
                                 ),
                                 flush=True
@@ -434,26 +432,24 @@ def rgtan_main(
 
             val_loss_epoch = float(val_loss_sum / max(val_count, 1))
 
-            # Full-val metrics (GTAN standard)
+            # Full-val metrics on val_ind
             val_scores = torch.softmax(oof_predictions[val_ind], dim=1)[:, 1].detach().cpu().numpy()
             val_labels_np = labels[val_ind].detach().cpu().numpy()
-            mask = val_labels_np != 2
-            val_scores = val_scores[mask]
-            val_labels_np = val_labels_np[mask]
+            m = val_labels_np != 2
+            val_scores = val_scores[m]
+            val_labels_np = val_labels_np[m]
 
             val_ap_epoch = float(average_precision_score(val_labels_np, val_scores)) if len(val_labels_np) else float("nan")
             val_auc_epoch = _safe_auc(val_labels_np, val_scores)
 
-            # -----------------------
-            # Comet: per-epoch logging (step=epoch)
-            # -----------------------
+            # Comet per epoch
             _log_metric(experiment, "train_loss", train_loss_epoch, step=epoch)
             _log_metric(experiment, "val_loss", val_loss_epoch, step=epoch)
             _log_metric(experiment, "val_ap", val_ap_epoch, step=epoch)
             _log_metric(experiment, "val_auc", val_auc_epoch, step=epoch)
+            _maybe_flush(experiment)
 
-            # Early stopping uses val_loss (same idea as original)
-            earlystoper.earlystop(torch.tensor(val_loss_epoch).to(device), model)
+            earlystoper.earlystop(val_loss_epoch, model)
             if earlystoper.is_earlystop:
                 print("Early Stopping!", flush=True)
                 break
@@ -494,7 +490,7 @@ def rgtan_main(
                     print("In test batch:{:04d}".format(step), flush=True)
 
     # -----------------------
-    # Final metrics (GTAN standard keys)
+    # Final metrics
     # -----------------------
     y_train = labels[train_idx].detach().cpu().numpy().copy()
     y_train[y_train == 2] = 0
@@ -506,10 +502,10 @@ def rgtan_main(
     test_scores = torch.softmax(test_predictions, dim=1).detach().cpu().numpy()[test_idx, 1]
     test_pred = torch.argmax(test_predictions, dim=1).detach().cpu().numpy()[test_idx]
 
-    mask = y_test != 2
-    y_test = y_test[mask]
-    test_scores = test_scores[mask]
-    test_pred = test_pred[mask]
+    m = y_test != 2
+    y_test = y_test[m]
+    test_scores = test_scores[m]
+    test_pred = test_pred[m]
 
     test_auc = float("nan") if len(np.unique(y_test)) < 2 else float(roc_auc_score(y_test, test_scores))
     test_f1 = float(f1_score(y_test, test_pred, average="macro"))
@@ -523,10 +519,24 @@ def rgtan_main(
     _log_metric(experiment, "test_auc", test_auc)
     _log_metric(experiment, "test_f1", test_f1)
     _log_metric(experiment, "test_ap", test_ap)
+    _maybe_flush(experiment)
 
 
+# -------------------------
+# Data loaders
+# -------------------------
 def loda_rgtan_data(dataset: str, test_size: float):
-    prefix = os.path.join(os.path.dirname(__file__), "..", "..", "data/")
+    """
+    Returns:
+      feat_data (pd.DataFrame),
+      labels (pd.Series),
+      train_idx (list[int]),
+      test_idx (list[int]),
+      g (dgl graph),
+      cat_features (list[str]),
+      neigh_features (pd.DataFrame or [])
+    """
+    prefix = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data")) + os.sep
 
     if dataset == 'S-FFSD':
         cat_features = ["Target", "Location", "Type"]
@@ -534,12 +544,9 @@ def loda_rgtan_data(dataset: str, test_size: float):
         df = pd.read_csv(prefix + "S-FFSDneofull.csv")
         df = df.loc[:, ~df.columns.str.contains('Unnamed')]
 
-        neigh_features = []
-        data = df[df["Labels"] <= 2]
-        data = data.reset_index(drop=True)
+        data = df[df["Labels"] <= 2].reset_index(drop=True)
 
-        alls = []
-        allt = []
+        alls, allt = [], []
         pair = ["Source", "Target", "Location", "Type"]
 
         for column in pair:
@@ -557,9 +564,9 @@ def loda_rgtan_data(dataset: str, test_size: float):
             allt.extend(tgt)
 
         g = dgl.graph((np.array(alls), np.array(allt)))
+        g = _ensure_self_loops(g)
 
-        cal_list = ["Source", "Target", "Location", "Type"]
-        for col in cal_list:
+        for col in ["Source", "Target", "Location", "Type"]:
             le = LabelEncoder()
             data[col] = le.fit_transform(data[col].apply(str).values)
 
@@ -569,8 +576,10 @@ def loda_rgtan_data(dataset: str, test_size: float):
         g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
         g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
-        graph_path = prefix + "graph-{}.bin".format(dataset)
-        dgl.data.utils.save_graphs(graph_path, [g])
+        try:
+            dgl.data.utils.save_graphs(prefix + f"graph-{dataset}.bin", [g])
+        except Exception:
+            pass
 
         index = list(range(len(labels)))
         train_idx, test_idx, _, _ = train_test_split(
@@ -578,16 +587,16 @@ def loda_rgtan_data(dataset: str, test_size: float):
             random_state=2, shuffle=True
         )
 
-        feat_neigh = pd.read_csv(prefix + "S-FFSD_neigh_feat.csv")
-        print("neighborhood feature loaded for nn input.", flush=True)
-        neigh_features = feat_neigh
+        # Neighbor features (as in original S-FFSD flow)
+        neigh_features = []
+        neigh_path = prefix + "S-FFSD_neigh_feat.csv"
+        if os.path.exists(neigh_path):
+            neigh_features = pd.read_csv(neigh_path)
+            print("neighborhood feature loaded for nn input.", flush=True)
 
     elif dataset in ("IEEE", "IEEE-CIS", "ieee", "ieeecis"):
-        # -----------------------
-        # IEEE-CIS Fraud Detection (Kaggle)
-        # -----------------------
         cat_features = []
-        neigh_features = []
+        neigh_features = []  # optional; keep empty unless you generate a neighbor-feature table
 
         zip_path = os.path.join(prefix, "ieee-fraud-detection.zip")
         tx_path, id_path = _find_ieee_files(prefix)
@@ -617,19 +626,16 @@ def loda_rgtan_data(dataset: str, test_size: float):
         labels = df["isFraud"].astype(int)
 
         # drop obvious non-features
-        drop_cols = []
-        for c in ["TransactionID"]:
-            if c in df.columns:
-                drop_cols.append(c)
-
+        drop_cols = [c for c in ["TransactionID"] if c in df.columns]
         feat_df = df.drop(columns=drop_cols)
 
-        # Build graph
-        g, used_entity_cols = _build_ieee_graph(
+        # Build graph + self loops (Option A)
+        g, _ = _build_ieee_graph(
             feat_df, time_col="TransactionDT", edge_per_trans=3, max_group_size=5000
         )
+        g = _ensure_self_loops(g)
 
-        # Identify categorical columns (object)
+        # Encode object columns as categorical
         obj_cols = [c for c in feat_df.columns if feat_df[c].dtype == "object"]
         for col in obj_cols:
             le = LabelEncoder()
@@ -649,14 +655,11 @@ def loda_rgtan_data(dataset: str, test_size: float):
                 else:
                     feat_df[col] = feat_df[col].fillna(0)
 
-        # assign node data
         g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
         g.ndata['feat'] = torch.from_numpy(feat_df.to_numpy()).to(torch.float32)
 
-        # save graph for reuse
-        graph_path = os.path.join(prefix, "graph-{}.bin".format("IEEE"))
         try:
-            dgl.data.utils.save_graphs(graph_path, [g])
+            dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE.bin"), [g])
         except Exception:
             pass
 
@@ -667,10 +670,6 @@ def loda_rgtan_data(dataset: str, test_size: float):
         )
 
         feat_data = feat_df
-
-        # NOTE: RGTAN "neigh_features" is optional; for IEEE we return [] by default.
-        # If you later generate neighbor-stat features (e.g., per-entity aggregates),
-        # load them here as a DataFrame with matching row count.
 
     elif dataset == 'yelp':
         cat_features = []
@@ -696,17 +695,21 @@ def loda_rgtan_data(dataset: str, test_size: float):
                 tgt.append(j)
 
         g = dgl.graph((np.array(src), np.array(tgt)))
+        g = _ensure_self_loops(g)
+
         g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
         g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
-        graph_path = prefix + "graph-{}.bin".format(dataset)
-        dgl.data.utils.save_graphs(graph_path, [g])
-
         try:
-            feat_neigh = pd.read_csv(prefix + "yelp_neigh_feat.csv")
-            print("neighborhood feature loaded for nn input.", flush=True)
-            neigh_features = feat_neigh
+            dgl.data.utils.save_graphs(prefix + f"graph-{dataset}.bin", [g])
         except Exception:
+            pass
+
+        neigh_path = prefix + "yelp_neigh_feat.csv"
+        if os.path.exists(neigh_path):
+            neigh_features = pd.read_csv(neigh_path)
+            print("neighborhood feature loaded for nn input.", flush=True)
+        else:
             print("no neighbohood feature used.", flush=True)
 
     elif dataset == 'amazon':
@@ -733,17 +736,24 @@ def loda_rgtan_data(dataset: str, test_size: float):
                 tgt.append(j)
 
         g = dgl.graph((np.array(src), np.array(tgt)))
+        g = _ensure_self_loops(g)
+
         g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
         g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
-        graph_path = prefix + "graph-{}.bin".format(dataset)
-        dgl.data.utils.save_graphs(graph_path, [g])
-
         try:
-            feat_neigh = pd.read_csv(prefix + "amazon_neigh_feat.csv")
-            print("neighborhood feature loaded for nn input.", flush=True)
-            neigh_features = feat_neigh
+            dgl.data.utils.save_graphs(prefix + f"graph-{dataset}.bin", [g])
         except Exception:
+            pass
+
+        neigh_path = prefix + "amazon_neigh_feat.csv"
+        if os.path.exists(neigh_path):
+            neigh_features = pd.read_csv(neigh_path)
+            print("neighborhood feature loaded for nn input.", flush=True)
+        else:
             print("no neighbohood feature used.", flush=True)
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
 
     return feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features
