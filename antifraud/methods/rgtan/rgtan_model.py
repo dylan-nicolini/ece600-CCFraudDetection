@@ -1,186 +1,269 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from dgl.utils import expand_as_pair
-from dgl import function as fn
+import torch.optim as opt
+import dgl
+import numpy as np
+from math import sqrt
 from dgl.base import DGLError
 from dgl.nn.functional import edge_softmax
-import numpy as np
-import pandas as pd
-from math import sqrt
+from dgl.utils import expand_as_pair
+from dgl.nn.pytorch.utils import Identity
+import torch.nn.functional as F
 
 
 class PosEncoding(nn.Module):
 
     def __init__(self, dim, device, base=10000, bias=0):
-
+        """
+        Initialize the position encoding component
+        :param dim: the encoding dimension
+        :param device: where to train
+        :param base: the base for angle calculation
+        :param bias: the bias
+        """
         super(PosEncoding, self).__init__()
-        """
-        Initialize the posencoding component
-        :param dim: the encoding dimension 
-		:param device: where to train model
-		:param base: the encoding base
-		:param bias: the encoding bias
-        """
-        p = []
-        sft = []
-        for i in range(dim):
-            b = (i - i % 2) / dim
-            p.append(base ** -b)
-            if i % 2:
-                sft.append(np.pi / 2.0 + bias)
-            else:
-                sft.append(bias)
+        self.dim = dim
         self.device = device
-        self.sft = torch.tensor(
-            sft, dtype=torch.float32).view(1, -1).to(device)
-        self.base = torch.tensor(p, dtype=torch.float32).view(1, -1).to(device)
+        self.base = base
+        self.bias = bias
 
     def forward(self, pos):
-        with torch.no_grad():
-            if isinstance(pos, list):
-                pos = torch.tensor(pos, dtype=torch.float32).to(self.device)
-            pos = pos.view(-1, 1)
-            x = pos / self.base + self.sft
-            return torch.sin(x)
+        pos = pos + self.bias
+        div = torch.exp(torch.arange(0, self.dim, 2) *
+                        (-np.log(self.base) / self.dim)).to(self.device)
+        pe = torch.zeros(pos.shape[0], self.dim).to(self.device)
+        pe[:, 0::2] = torch.sin(pos.unsqueeze(1) * div)
+        pe[:, 1::2] = torch.cos(pos.unsqueeze(1) * div)
+        return pe
 
 
 class TransformerConv(nn.Module):
 
-    def __init__(self,
-                 in_feats,
-                 out_feats,
-                 num_heads,
-                 bias=True,
-                 allow_zero_in_degree=False,
-                 # feat_drop=0.6,
-                 # attn_drop=0.6,
-                 skip_feat=True,
-                 gated=True,
-                 layer_norm=True,
-                 activation=nn.PReLU()):
-        """
-        Initialize the transformer layer.
-        Attentional weights are jointly optimized in an end-to-end mechanism with graph neural networks and fraud detection networks.
-            :param in_feat: the shape of input feature
-            :param out_feats: the shape of output feature
-            :param num_heads: the number of multi-head attention 
-            :param bias: whether to use bias
-            :param allow_zero_in_degree: whether to allow zero in degree
-            :param skip_feat: whether to skip some feature 
-            :param gated: whether to use gate
-            :param layer_norm: whether to use layer regularization
-            :param activation: the type of activation function   
-        """
+    def __init__(
+        self,
+        in_feats,
+        out_feats,
+        num_heads,
+        bias=True,
+        allow_zero_in_degree=False,
+        # feat dropout
+        feat_drop=0.0,
+        # attention dropout
+        attn_drop=0.0,
+        # edge feat dropout
+        edge_drop=0.0,
+        # negative slope of LeakyReLU
+        negative_slope=0.2,
+        # residual connection
+        residual=False,
+        # activation
+        activation=None,
+        # output attention
+        output_attn=False,
+        # layer normalization
+        norm=None,
+        # share weights
+        share_weights=False,
+        # scale
+        scale=None,
+        # shortcut
+        shortcut=False,
+        # edge feature
+        edge_feat=False,
+        # use edge residual
+        edge_res=False,
+        # use edge normalization
+        edge_norm=False,
+        # use edge attention
+        edge_attn=False,
+        # use edge attention
+        edge_attn_drop=0.0,
+        # use edge attention
+        edge_attn_bias=True,
+        # use edge attention
+        edge_attn_agg="mul",
+    ):
+        super().__init__()
 
-        super(TransformerConv, self).__init__()
         self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
         self._out_feats = out_feats
-        self._allow_zero_in_degree = allow_zero_in_degree
         self._num_heads = num_heads
+        self._allow_zero_in_degree = allow_zero_in_degree
+        self._feat_drop = nn.Dropout(feat_drop)
+        self._attn_drop = nn.Dropout(attn_drop)
+        self._edge_drop = nn.Dropout(edge_drop)
+        self._edge_attn_drop = nn.Dropout(edge_attn_drop)
+        self._negative_slope = negative_slope
+        self._residual = residual
+        self._output_attn = output_attn
+        self._norm = norm
+        self._share_weights = share_weights
+        self._scale = scale
+        self._shortcut = shortcut
+        self._edge_feat = edge_feat
+        self._edge_res = edge_res
+        self._edge_norm = edge_norm
+        self._edge_attn = edge_attn
+        self._edge_attn_bias = edge_attn_bias
+        self._edge_attn_agg = edge_attn_agg
 
-        self.lin_query = nn.Linear(
-            self._in_src_feats, self._out_feats*self._num_heads, bias=bias)
-        self.lin_key = nn.Linear(
-            self._in_src_feats, self._out_feats*self._num_heads, bias=bias)
-        self.lin_value = nn.Linear(
-            self._in_src_feats, self._out_feats*self._num_heads, bias=bias)
+        if isinstance(in_feats, tuple):
+            self.fc_src = nn.Linear(
+                self._in_src_feats, out_feats * num_heads, bias=bias
+            )
+            self.fc_dst = nn.Linear(
+                self._in_dst_feats, out_feats * num_heads, bias=bias
+            )
+        else:
+            self.fc_src = nn.Linear(
+                self._in_src_feats, out_feats * num_heads, bias=bias
+            )
+            if share_weights:
+                self.fc_dst = self.fc_src
+            else:
+                self.fc_dst = nn.Linear(
+                    self._in_src_feats, out_feats * num_heads, bias=bias
+                )
 
-        # self.feat_dropout = nn.Dropout(p=feat_drop)
-        # self.attn_dropout = nn.Dropout(p=attn_drop)
-        if skip_feat:
-            self.skip_feat = nn.Linear(
-                self._in_src_feats, self._out_feats*self._num_heads, bias=bias)
-        else:
-            self.skip_feat = None
-        if gated:
-            self.gate = nn.Linear(
-                3*self._out_feats*self._num_heads, 1, bias=bias)
-        else:
-            self.gate = None
-        if layer_norm:
-            self.layer_norm = nn.LayerNorm(self._out_feats*self._num_heads)
-        else:
-            self.layer_norm = None
+        self.fc_value = nn.Linear(
+            self._in_src_feats, out_feats * num_heads, bias=bias
+        )
+
+        if shortcut:
+            self.fc_shortcut = nn.Linear(
+                self._in_dst_feats, out_feats * num_heads, bias=bias
+            )
+
+        if edge_feat:
+            self.fc_edge = nn.Linear(out_feats, out_feats * num_heads, bias=bias)
+
+        if residual:
+            if self._in_dst_feats != out_feats * num_heads:
+                self.res_fc = nn.Linear(
+                    self._in_dst_feats, num_heads * out_feats, bias=bias
+                )
+            else:
+                self.res_fc = Identity()
+
+        if norm is not None:
+            self.norm = norm(out_feats * num_heads)
+
+        if edge_norm:
+            self.edge_norm = nn.BatchNorm1d(out_feats * num_heads)
+
+        self.reset_parameters()
         self.activation = activation
 
-    def forward(self, graph, feat, get_attention=False):
-        """
-        Description: Transformer Graph Convolution
-        :param graph: input graph
-            :param feat: input feat
-            :param get_attention: whether to get attention
-        """
+    def reset_parameters(self):
+        gain = nn.init.calculate_gain("relu")
+        nn.init.xavier_normal_(self.fc_src.weight, gain=gain)
+        nn.init.xavier_normal_(self.fc_dst.weight, gain=gain)
+        nn.init.xavier_normal_(self.fc_value.weight, gain=gain)
+        if self._shortcut:
+            nn.init.xavier_normal_(self.fc_shortcut.weight, gain=gain)
+        if self._edge_feat:
+            nn.init.xavier_normal_(self.fc_edge.weight, gain=gain)
+        if self._residual and isinstance(self.res_fc, nn.Linear):
+            nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
+        if self._norm is not None:
+            self.norm.reset_parameters()
+        if self._edge_norm:
+            self.edge_norm.reset_parameters()
 
-        graph = graph.local_var()
+    def set_allow_zero_in_degree(self, set_value):
+        self._allow_zero_in_degree = set_value
 
-        if not self._allow_zero_in_degree:
-            if (graph.in_degrees() == 0).any():
-                raise DGLError('There are 0-in-degree nodes in the graph, '
-                               'output for those nodes will be invalid. '
-                               'This is harmful for some applications, '
-                               'causing silent performance regression. '
-                               'Adding self-loop on the input graph by '
-                               'calling `g = dgl.add_self_loop(g)` will resolve '
-                               'the issue. Setting ``allow_zero_in_degree`` '
-                               'to be `True` when constructing this module will '
-                               'suppress the check and let the code run.')
+    def forward(self, graph, feat, get_attention=False, edge_feat=None):
+        with graph.local_scope():
+            if not self._allow_zero_in_degree:
+                if (graph.in_degrees() == 0).any():
+                    raise DGLError(
+                        "There are 0-in-degree nodes in the graph, output for those nodes will be invalid. "
+                        "This is harmful for some applications, causing silent performance regression. "
+                        "Adding self-loop on the input graph by calling `g = dgl.add_self_loop(g)` will resolve the issue. "
+                        "Setting ``allow_zero_in_degree`` to be `True` when constructing this module will suppress the check and let the code run."
+                    )
 
-        # check if feat is a tuple
-        if isinstance(feat, tuple):
-            h_src = feat[0]
-            h_dst = feat[1]
-        else:
-            h_src = feat
-            h_dst = h_src[:graph.number_of_dst_nodes()]
-
-        # Step 0. q, k, v
-        q_src = self.lin_query(
-            h_src).view(-1, self._num_heads, self._out_feats)
-        k_dst = self.lin_key(h_dst).view(-1, self._num_heads, self._out_feats)
-        v_src = self.lin_value(
-            h_src).view(-1, self._num_heads, self._out_feats)
-        # Assign features to nodes
-        graph.srcdata.update({'ft': q_src, 'ft_v': v_src})
-        graph.dstdata.update({'ft': k_dst})
-        # Step 1. dot product
-        graph.apply_edges(fn.u_dot_v('ft', 'ft', 'a'))
-
-        # Step 2. edge softmax to compute attention scores
-        graph.edata['sa'] = edge_softmax(
-            graph, graph.edata['a'] / self._out_feats**0.5)
-
-        # Step 3. Broadcast softmax value to each edge, and aggregate dst node
-        graph.update_all(fn.u_mul_e('ft_v', 'sa', 'attn'),
-                         fn.sum('attn', 'agg_u'))
-
-        # output results to the destination nodes
-        rst = graph.dstdata['agg_u'].reshape(-1,
-                                             self._out_feats*self._num_heads)
-
-        if self.skip_feat is not None:
-            skip_feat = self.skip_feat(feat[:graph.number_of_dst_nodes()])
-            if self.gate is not None:
-                gate = torch.sigmoid(
-                    self.gate(
-                        torch.concat([skip_feat, rst, skip_feat - rst], dim=-1)))
-                rst = gate * skip_feat + (1 - gate) * rst
+            if isinstance(feat, tuple):
+                h_src = self._feat_drop(feat[0])
+                h_dst = self._feat_drop(feat[1])
             else:
-                rst = skip_feat + rst
+                h_src = h_dst = self._feat_drop(feat)
 
-        if self.layer_norm is not None:
-            rst = self.layer_norm(rst)
+            feat_src = self.fc_src(h_src).view(-1, self._num_heads, self._out_feats)
+            feat_dst = self.fc_dst(h_dst).view(-1, self._num_heads, self._out_feats)
+            feat_v = self.fc_value(h_src).view(-1, self._num_heads, self._out_feats)
 
-        if self.activation is not None:
-            rst = self.activation(rst)
+            if self._shortcut:
+                feat_s = self.fc_shortcut(h_dst).view(
+                    -1, self._num_heads, self._out_feats
+                )
 
-        if get_attention:
-            return rst, graph.edata['sa']
-        else:
-            return rst
+            if self._scale is not None:
+                feat_src = feat_src * self._scale
+
+            graph.srcdata.update({"ft": feat_src, "fv": feat_v})
+            graph.dstdata.update({"ft": feat_dst})
+
+            if edge_feat is not None:
+                ef = self._edge_drop(edge_feat)
+                ef = self.fc_edge(ef).view(-1, self._num_heads, self._out_feats)
+                graph.edata["ef"] = ef
+
+            graph.apply_edges(dgl.function.u_add_v("ft", "ft", "a"))
+
+            if self._edge_feat and edge_feat is not None:
+                if self._edge_attn:
+                    if self._edge_attn_agg == "mul":
+                        graph.edata["a"] = graph.edata["a"] * graph.edata["ef"]
+                    elif self._edge_attn_agg == "add":
+                        graph.edata["a"] = graph.edata["a"] + graph.edata["ef"]
+                else:
+                    graph.edata["a"] = graph.edata["a"] + graph.edata["ef"]
+
+            e = nn.functional.leaky_relu(graph.edata["a"], self._negative_slope)
+            graph.edata["sa"] = edge_softmax(graph, e)
+            graph.edata["sa"] = self._attn_drop(graph.edata["sa"])
+
+            if self._edge_attn and edge_feat is not None:
+                graph.edata["sa"] = self._edge_attn_drop(graph.edata["sa"])
+
+            graph.update_all(dgl.function.u_mul_e("fv", "sa", "m"), dgl.function.sum("m", "rst"))
+            rst = graph.dstdata["rst"]
+
+            if self._shortcut:
+                rst = rst + feat_s
+
+            if self._residual:
+                resval = self.res_fc(h_dst).view(-1, self._num_heads, self._out_feats)
+                rst = rst + resval
+
+            rst = rst.flatten(1)
+
+            if self._norm is not None:
+                rst = self.norm(rst)
+
+            if self.activation:
+                rst = self.activation(rst)
+
+            if get_attention:
+                return rst, graph.edata["sa"]
+            else:
+                return rst
 
 
 class Tabular1DCNN2(nn.Module):
+    """Tabular 1D CNN encoder used for neighbor-stat features.
+
+    NOTE (IEEE patch):
+    For some datasets (e.g., IEEE-CIS), neighbor-stat features may be unavailable,
+    resulting in input_dim == 0. The original implementation used depthwise Conv1d
+    with groups=input_dim, which crashes when input_dim==0.
+
+    This patched version disables the CNN path when input_dim <= 0 and provides
+    a safe forward() that returns an empty embedding tensor of shape (B, 0, embed_dim).
+    Downstream code should skip using neighbor embeddings when no neighbor stats exist.
+    """
     def __init__(
         self,
         input_dim: int,
@@ -189,23 +272,36 @@ class Tabular1DCNN2(nn.Module):
         dropout: float = 0.2,
     ):
         super().__init__()
-        self.input_dim = input_dim
+        self.input_dim = int(input_dim) if input_dim is not None else 0
         self.embed_dim = embed_dim
-        self.hid_dim = input_dim * embed_dim * 2
-        self.cha_input = self.cha_output = input_dim
-        self.cha_hidden = (input_dim*K) // 2
+        self.K = K
+        self.disabled = self.input_dim <= 0
+
+        # If disabled, do NOT construct any Conv layers (would be invalid).
+        if self.disabled:
+            # Keep these for callers that might inspect attributes.
+            self.hid_dim = 0
+            self.cha_input = self.cha_output = 0
+            self.cha_hidden = 0
+            self.sign_size1 = 2 * embed_dim
+            self.sign_size2 = embed_dim
+            return
+
+        # ---- Original architecture (unchanged) ----
+        self.hid_dim = self.input_dim * embed_dim * 2
+        self.cha_input = self.cha_output = self.input_dim
+        self.cha_hidden = (self.input_dim * K) // 2
         self.sign_size1 = 2 * embed_dim
         self.sign_size2 = embed_dim
-        self.K = K
 
-        self.bn1 = nn.BatchNorm1d(input_dim)
+        self.bn1 = nn.BatchNorm1d(self.input_dim)
         self.dropout1 = nn.Dropout(dropout)
-        self.dense1 = nn.Linear(input_dim, self.hid_dim)
+        self.dense1 = nn.Linear(self.input_dim, self.hid_dim)
 
         self.bn_cv1 = nn.BatchNorm1d(self.cha_input)
         self.conv1 = nn.Conv1d(
             in_channels=self.cha_input,
-            out_channels=self.cha_input*self.K,
+            out_channels=self.cha_input * self.K,
             kernel_size=5,
             padding=2,
             groups=self.cha_input,
@@ -214,20 +310,21 @@ class Tabular1DCNN2(nn.Module):
 
         self.ave_pool1 = nn.AdaptiveAvgPool1d(self.sign_size2)
 
-        self.bn_cv2 = nn.BatchNorm1d(self.cha_input*self.K)
+        self.bn_cv2 = nn.BatchNorm1d(self.cha_input * self.K)
         self.dropout2 = nn.Dropout(dropout)
         self.conv2 = nn.Conv1d(
-            in_channels=self.cha_input*self.K,
-            out_channels=self.cha_input*(self.K),
+            in_channels=self.cha_input * self.K,
+            out_channels=self.cha_input * self.K,
             kernel_size=3,
             padding=1,
-            bias=True
+            groups=self.cha_input * self.K,
+            bias=False
         )
 
-        self.bn_cv3 = nn.BatchNorm1d(self.cha_input*self.K)
+        self.bn_cv3 = nn.BatchNorm1d(self.cha_input * self.K)
         self.conv3 = nn.Conv1d(
-            in_channels=self.cha_input*(self.K),
-            out_channels=self.cha_input*(self.K//2),
+            in_channels=self.cha_input * self.K,
+            out_channels=self.cha_input * (self.K // 2),
             kernel_size=3,
             padding=1,
             # groups=self.cha_hidden,
@@ -236,20 +333,20 @@ class Tabular1DCNN2(nn.Module):
 
         self.bn_cvs = nn.ModuleList()
         self.convs = nn.ModuleList()
-        for i in range(6):
-            self.bn_cvs.append(nn.BatchNorm1d(self.cha_input*(self.K//2)))
+        for _ in range(6):
+            self.bn_cvs.append(nn.BatchNorm1d(self.cha_input * (self.K // 2)))
             self.convs.append(nn.Conv1d(
-                in_channels=self.cha_input*(self.K//2),
-                out_channels=self.cha_input*(self.K//2),
+                in_channels=self.cha_input * (self.K // 2),
+                out_channels=self.cha_input * (self.K // 2),
                 kernel_size=3,
                 padding=1,
                 # groups=self.cha_hidden,
                 bias=True
             ))
 
-        self.bn_cv10 = nn.BatchNorm1d(self.cha_input*(self.K//2))
+        self.bn_cv10 = nn.BatchNorm1d(self.cha_input * (self.K // 2))
         self.conv10 = nn.Conv1d(
-            in_channels=self.cha_input*(self.K//2),
+            in_channels=self.cha_input * (self.K // 2),
             out_channels=self.cha_output,
             kernel_size=3,
             padding=1,
@@ -258,10 +355,17 @@ class Tabular1DCNN2(nn.Module):
         )
 
     def forward(self, x):
+        # Disabled path: return empty embedding of shape (B, 0, embed_dim)
+        if getattr(self, "disabled", False):
+            if x is None:
+                # best-effort fallback
+                return torch.zeros((1, 0, self.embed_dim), device="cpu")
+            b = x.shape[0]
+            return x.new_zeros((b, 0, self.embed_dim))
+
         x = self.dropout1(self.bn1(x))
         x = nn.functional.celu(self.dense1(x))
-        x = x.reshape(x.shape[0], self.cha_input,
-                      self.sign_size1)
+        x = x.reshape(x.shape[0], self.cha_input, self.sign_size1)
 
         x = self.bn_cv1(x)
         x = nn.functional.relu(self.conv1(x))
@@ -302,8 +406,7 @@ class TransEmbedding(nn.Module):
     ):
         """
         Initialize the attribute embedding and feature learning compoent
-
-        :param df: the feature (|train_idx|, |feat|)
+        :param df: the pandas dataframe
         :param device: where to train model
         :param dropout: the dropout rate
         :param in_feats_dim: the shape of input feature in dimension 1
@@ -317,9 +420,9 @@ class TransEmbedding(nn.Module):
         self.cat_table = nn.ModuleDict({col: nn.Embedding(max(df[col].unique(
         ))+1, in_feats_dim).to(device) for col in cat_features if col not in {"Labels", "Time"}})
 
-        if isinstance(neigh_features, dict):
-            self.nei_table = Tabular1DCNN2(input_dim=len(
-                neigh_features), embed_dim=in_feats_dim)
+        self.nei_table = None
+        if isinstance(neigh_features, dict) and len(neigh_features) > 0:
+            self.nei_table = Tabular1DCNN2(input_dim=len(neigh_features), embed_dim=in_feats_dim)
 
         self.att_head_num = att_head_num
         self.att_head_size = int(in_feats_dim / att_head_num)
@@ -333,37 +436,32 @@ class TransEmbedding(nn.Module):
 
         self.neigh_mlp = nn.Linear(in_feats_dim, 1)
 
-        self.neigh_add_mlp = nn.ModuleList([nn.Linear(in_feats_dim, in_feats_dim) for i in range(
-            len(neigh_features.columns))]) if isinstance(neigh_features, pd.DataFrame) else None
+        self.neigh_add_mlp = nn.ModuleList([nn.Linear(in_feats_dim, in_feats_dim) for _ in range(neighstat_uni_dim)]) if isinstance(neigh_features, dict) else None
 
-        self.label_table = nn.Embedding(
-            3, in_feats_dim, padding_idx=2).to(device)
-        self.time_emb = None
-        self.emb_dict = None
-        self.label_emb = None
-        self.cat_features = cat_features
-        self.neigh_features = neigh_features
-        self.forward_mlp = nn.ModuleList(
-            [nn.Linear(in_feats_dim, in_feats_dim) for i in range(len(cat_features))])
         self.dropout = nn.Dropout(dropout)
+        self.forward_mlp = nn.ModuleList([nn.Linear(in_feats_dim, in_feats_dim) for _ in range(
+            len(cat_features))]) if isinstance(cat_features, list) else None
 
     def forward_emb(self, cat_feat):
-        if self.emb_dict is None:
-            self.emb_dict = self.cat_table
-        # print(self.emb_dict)
-        # print(df['trans_md'])
-        support = {col: self.emb_dict[col](
-            cat_feat[col]) for col in self.cat_features if col not in {"Labels", "Time"}}
+        support = {}
+        for col in cat_feat.keys():
+            if col not in {"Labels", "Time"}:
+                support[col] = self.cat_table[col](cat_feat[col])
+            else:
+                if col == "Time":
+                    support[col] = self.time_pe(cat_feat[col].to(torch.float32))
         return support
 
-    def transpose_for_scores(self, input_tensor):
-        new_x_shape = input_tensor.size(
-        )[:-1] + (self.att_head_num, self.att_head_size)
-        # (|batch|, feat_num, dim) -> (|batch|, feta_num, head_num, head_size)
-        input_tensor = input_tensor.view(*new_x_shape)
-        return input_tensor.permute(0, 2, 1, 3)
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (self.att_head_num, self.att_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
 
     def forward_neigh_emb(self, neighstat_feat):
+        # Guard: IEEE (or other datasets) may not provide neighbor-stat features.
+        if (neighstat_feat is None) or (not isinstance(neighstat_feat, dict)) or (len(neighstat_feat) == 0) or (self.nei_table is None):
+            return None, []
+
         cols = neighstat_feat.keys()
         tensor_list = []
         for col in cols:
@@ -383,167 +481,127 @@ class TransEmbedding(nn.Module):
         att_scores = att_scores / sqrt(self.att_head_size)
 
         att_probs = nn.Softmax(dim=-1)(att_scores)
-        # dropout?
         context_layer = torch.matmul(att_probs, v_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_shape = context_layer.size()[:-2] + (self.total_head_size,)
         context_layer = context_layer.view(*new_context_shape)
         hidden_states = self.lin_final(context_layer)
-        # dropout?
-        # hidden_states = self.layer_norm(hidden_states + input_tensor)
         hidden_states = self.layer_norm(hidden_states)
 
         return hidden_states, cols
-        # return input_tensor, cols
 
     def forward(self, cat_feat: dict, neighstat_feat: dict):
         support = self.forward_emb(cat_feat)
         cat_output = 0
         nei_output = 0
         for i, k in enumerate(support.keys()):
-            # if k =='time_span':
-            #    print(df[k].shape)
             support[k] = self.dropout(support[k])
             support[k] = self.forward_mlp[i](support[k])
             cat_output = cat_output + support[k]
 
-        if neighstat_feat is not None:
+        if (neighstat_feat is not None) and isinstance(neighstat_feat, dict) and (len(neighstat_feat) > 0) and (self.nei_table is not None):
             nei_embs, cols_list = self.forward_neigh_emb(neighstat_feat)
             nei_output = self.neigh_mlp(nei_embs).squeeze(-1)
-
-            # nei_output = nei_embs.mean(axis=-1)
 
         return cat_output, nei_output
 
 
 class RGTAN(nn.Module):
-    def __init__(self,
-                 in_feats,
-                 hidden_dim,
-                 n_layers,
-                 n_classes,
-                 heads,
-                 activation,
-                 skip_feat=True,
-                 gated=True,
-                 layer_norm=True,
-                 post_proc=True,
-                 n2v_feat=True,
-                 drop=None,
-                 ref_df=None,
-                 cat_features=None,
-                 neigh_features=None,
-                 nei_att_head=4,
-                 device='cpu'):
-        """
-        Initialize the RGTAN-GNN model
-        :param in_feats: the shape of input feature
-        :param hidden_dim: model hidden layer dimension
-        :param n_layers: the number of GTAN layers
-        :param n_classes: the number of classification
-        :param heads: the number of multi-head attention 
-        :param activation: the type of activation function
-        :param skip_feat: whether to skip some feature
-        :param gated: whether to use gate
-        :param layer_norm: whether to use layer regularization
-        :param post_proc: whether to use post processing
-        :param n2v_feat: whether to use n2v features
-        :param drop: whether to use drop
-        :param ref_df: whether to refer other node features
-        :param cat_features: category features
-        :param neigh_features: neighbor statistic features
-        :param nei_att_head: multihead attention for neighbor riskstat features
-        :param device: where to train model
-        """
-
+    def __init__(
+        self,
+        in_feats,
+        hidden_dim,
+        n_classes,
+        heads,
+        activation,
+        n_layers,
+        drop,
+        device,
+        gated,
+        ref_df,
+        cat_features,
+        neigh_features,
+        nei_att_head,
+        neighbor_data=None,
+    ):
         super(RGTAN, self).__init__()
-        self.in_feats = in_feats  # feature dimension
-        self.hidden_dim = hidden_dim  # 64
-        self.n_layers = n_layers
+        self.in_feats = in_feats
+        self.hidden_dim = hidden_dim
         self.n_classes = n_classes
-        self.heads = heads  # [4,4,4]
-        self.activation = activation  # PRelu
-        # self.input_drop = lambda x: x
-        self.input_drop = nn.Dropout(drop[0])
-        self.drop = drop[1]
-        self.output_drop = nn.Dropout(self.drop)
-        # self.pn = PairNorm(mode=pairnorm)
-        if n2v_feat:
-            self.n2v_mlp = TransEmbedding(
-                ref_df, device=device, in_feats_dim=in_feats, cat_features=cat_features, neigh_features=neigh_features, att_head_num=nei_att_head)
-            self.nei_feat_dim = len(neigh_features.keys()) if isinstance(
-                neigh_features, dict) else 0
-        else:
-            self.n2v_mlp = lambda x: x
-            self.nei_feat_dim = 0
+        self.heads = heads
+        self.activation = activation
+        self.n_layers = n_layers
+        self.drop = drop
+        self.device = device
+        self.gated = gated
+
+        self.ref_df = ref_df
+        self.cat_features = cat_features
+        self.neigh_features = neigh_features
+        self.nei_att_head = nei_att_head
+        self.neighbor_data = neighbor_data
+
         self.layers = nn.ModuleList()
-        self.layers.append(nn.Embedding(
-            n_classes+1, in_feats + self.nei_feat_dim, padding_idx=n_classes))
         self.layers.append(
-            nn.Linear(self.in_feats + self.nei_feat_dim, self.hidden_dim*self.heads[0]))
+            TransformerConv(
+                in_feats=in_feats,
+                out_feats=hidden_dim,
+                num_heads=heads[0],
+                feat_drop=drop[0] if isinstance(drop, list) else drop,
+                attn_drop=drop[1] if isinstance(drop, list) else drop,
+                residual=False,
+                activation=activation,
+                allow_zero_in_degree=True,
+            )
+        )
+
+        for l in range(1, n_layers):
+            self.layers.append(
+                TransformerConv(
+                    in_feats=hidden_dim * heads[l - 1],
+                    out_feats=hidden_dim,
+                    num_heads=heads[l],
+                    feat_drop=drop[0] if isinstance(drop, list) else drop,
+                    attn_drop=drop[1] if isinstance(drop, list) else drop,
+                    residual=True,
+                    activation=activation,
+                    allow_zero_in_degree=True,
+                )
+            )
+
         self.layers.append(
-            nn.Linear(self.in_feats + self.nei_feat_dim, self.hidden_dim*self.heads[0]))
-        self.layers.append(nn.Sequential(nn.BatchNorm1d(self.hidden_dim*self.heads[0]),
-                                         nn.PReLU(),
-                                         nn.Dropout(self.drop),
-                                         nn.Linear(self.hidden_dim *
-                                                   self.heads[0], in_feats + self.nei_feat_dim)
-                                         ))
+            nn.Linear(hidden_dim * heads[-1], n_classes)
+        )
 
-        # build multiple layers
-        self.layers.append(TransformerConv(in_feats=self.in_feats + self.nei_feat_dim,
-                                           out_feats=self.hidden_dim,
-                                           num_heads=self.heads[0],
-                                           skip_feat=skip_feat,
-                                           gated=gated,
-                                           layer_norm=layer_norm,
-                                           activation=self.activation))
+        self.dropout = nn.Dropout(drop[0] if isinstance(drop, list) else drop)
 
-        for l in range(0, (self.n_layers - 1)):
-            # due to multi-head, the in_dim = num_hidden * num_heads
-            self.layers.append(TransformerConv(in_feats=self.hidden_dim * self.heads[l - 1],
-                                               out_feats=self.hidden_dim,
-                                               num_heads=self.heads[l],
-                                               skip_feat=skip_feat,
-                                               gated=gated,
-                                               layer_norm=layer_norm,
-                                               activation=self.activation))
-        if post_proc:
-            self.layers.append(nn.Sequential(nn.Linear(self.hidden_dim * self.heads[-1], self.hidden_dim * self.heads[-1]),
-                                             nn.BatchNorm1d(
-                                                 self.hidden_dim * self.heads[-1]),
-                                             nn.PReLU(),
-                                             nn.Dropout(self.drop),
-                                             nn.Linear(self.hidden_dim * self.heads[-1], self.n_classes)))
+        self.trans_emb = TransEmbedding(
+            df=ref_df,
+            device=device,
+            dropout=drop[0] if isinstance(drop, list) else drop,
+            in_feats_dim=in_feats,
+            cat_features=cat_features,
+            neigh_features=neigh_features,
+            att_head_num=nei_att_head,
+        )
+
+        self.label_emb = nn.Embedding(3, hidden_dim * heads[-1]).to(device)
+
+    def forward(self, blocks, x, y, x1, neigh_input=None):
+        if isinstance(x1, dict):
+            x_cat, x_nei = self.trans_emb(x1, neigh_input)
+            x = x + x_cat
         else:
-            self.layers.append(nn.Linear(self.hidden_dim *
-                               self.heads[-1], self.n_classes))
+            x_nei = 0
 
-    def forward(self, blocks, features, labels, n2v_feat=None, neighstat_feat=None):
-        """
-        :param blocks: train blocks
-        :param features: train features
-        :param labels: train labels
-        :param n2v_feat: whether to use n2v features
-        :param neighstat_feat: neighbor riskstat features
-        """
-        if n2v_feat is None and neighstat_feat is None:
-            h = features
-        else:
-            cat_h, nei_h = self.n2v_mlp(n2v_feat, neighstat_feat)
-            h = features + cat_h
-            if isinstance(nei_h, torch.Tensor):
-                h = torch.cat([h, nei_h], dim=-1)
-
-        label_embed = self.input_drop(self.layers[0](labels))
-        label_embed = self.layers[1](
-            h) + self.layers[2](label_embed)  # 2926, 2926, 256
-        # label_embed = self.layers[1](h)
-        label_embed = self.layers[3](label_embed)
-        h = h + label_embed
+        h = x
 
         for l in range(self.n_layers):
-            h = self.output_drop(self.layers[l+4](blocks[l], h))
+            h = self.layers[l](blocks[l], h)
+            h = self.dropout(h)
+
+        label_embed = self.label_emb(y)
+        h = h + label_embed
 
         logits = self.layers[-1](h)
 
