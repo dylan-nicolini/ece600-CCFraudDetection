@@ -261,7 +261,7 @@ def rgtan_main(
             for col in neigh_features.columns
         }
     else:
-        nei_feat = []
+        nei_feat = {}   # ✅ empty dict, not list
 
     # Labels tensor
     y_series = labels
