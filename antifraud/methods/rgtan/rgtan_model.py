@@ -39,13 +39,13 @@ class PosEncoding(nn.Module):
 # -----------------------------
 class TransformerConv(nn.Module):
     """
-    A lightweight attention-based conv adapted to DGL blocks.
+    Attention conv that is DGLBlock-safe.
 
     KEY FIX:
       If graph is a DGLBlock, src and dst node sets differ.
       We must use:
         h_src for src nodes (num_src)
-        h_dst for dst nodes (num_dst), where dst nodes are the first num_dst nodes in the src list.
+        h_dst for dst nodes (num_dst), where dst nodes are the first num_dst nodes in src.
     """
 
     def __init__(
@@ -74,18 +74,13 @@ class TransformerConv(nn.Module):
         self.residual = residual
         self.activation = activation
 
-        # Q/K projections (we compute attention using dst/src projections)
         self.fc_src = nn.Linear(self._in_src_feats, out_feats * num_heads, bias=bias)
         self.fc_dst = nn.Linear(self._in_dst_feats, out_feats * num_heads, bias=bias)
-
-        # Value projection
         self.fc_value = nn.Linear(self._in_src_feats, out_feats * num_heads, bias=bias)
 
-        # Attention vectors
         self.attn_l = nn.Parameter(torch.FloatTensor(size=(1, num_heads, out_feats)))
         self.attn_r = nn.Parameter(torch.FloatTensor(size=(1, num_heads, out_feats)))
 
-        # Residual projection (only if needed)
         if residual and (self._in_dst_feats != out_feats * num_heads):
             self.res_fc = nn.Linear(self._in_dst_feats, out_feats * num_heads, bias=bias)
         else:
@@ -119,7 +114,6 @@ class TransformerConv(nn.Module):
             else:
                 h_src = self.feat_drop(feat)
                 if getattr(graph, "is_block", False):
-                    # dst nodes are the first num_dst_nodes of src nodes in DGL blocks
                     h_dst = h_src[: graph.num_dst_nodes()]
                 else:
                     h_dst = h_src
@@ -148,7 +142,7 @@ class TransformerConv(nn.Module):
                     resval = self.res_fc(h_dst).view(-1, self._num_heads, self._out_feats)
                     rst = rst + resval
                 else:
-                    # Only safe when in_dst_feats == out_feats * num_heads
+                    # only safe if in-dst == out_feats*num_heads
                     rst = rst + h_dst.view(-1, self._num_heads, self._out_feats)
 
             rst = rst.flatten(1)  # (Nd, H*F)
@@ -162,14 +156,14 @@ class TransformerConv(nn.Module):
 
 
 # -----------------------------
-# Neighbor-stat CNN (IEEE-safe)
+# Neighbor-stat encoder (IEEE-safe)
 # -----------------------------
 class Tabular1DCNN2(nn.Module):
     """
     Encodes neighbor-stat features.
 
     IEEE FIX:
-      If input_dim <= 0, disable this module and return an empty embedding.
+      If input_dim <= 0, disable and return an empty embedding.
     """
 
     def __init__(self, input_dim: int, embed_dim: int, dropout: float = 0.2):
@@ -181,24 +175,19 @@ class Tabular1DCNN2(nn.Module):
         if self.disabled:
             return
 
-        # Map (B, input_dim) -> (B, input_dim, embed_dim) via a simple MLP
+        # Simple projection: (B, input_dim) -> (B, input_dim, embed_dim)
         self.bn = nn.BatchNorm1d(self.input_dim)
         self.drop = nn.Dropout(dropout)
         self.proj = nn.Linear(self.input_dim, self.input_dim * self.embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, input_dim)
-        returns: (B, input_dim, embed_dim)
-        """
         if self.disabled:
             if x is None:
                 return torch.zeros((1, 0, self.embed_dim), device="cpu")
             return x.new_zeros((x.shape[0], 0, self.embed_dim))
 
         x = self.drop(self.bn(x))
-        x = self.proj(x)
-        x = torch.relu(x)
+        x = torch.relu(self.proj(x))
         x = x.view(x.shape[0], self.input_dim, self.embed_dim)
         return x
 
@@ -208,11 +197,11 @@ class Tabular1DCNN2(nn.Module):
 # -----------------------------
 class TransEmbedding(nn.Module):
     """
-    Embeds categorical columns + (optional) neighbor-stat dict.
+    Embeds categorical columns + optional neighbor-stat dict.
 
     Fixes:
-      - Always creates forward_mlp sized to cat cols (never None).
-      - Skips neighbor-stat branch when dict empty / None.
+      - forward_mlp always exists and matches cat_cols (no NoneType crash)
+      - neighbor-stat branch safely skipped when empty for IEEE
     """
 
     def __init__(
@@ -230,32 +219,30 @@ class TransEmbedding(nn.Module):
         self.in_feats_dim = in_feats_dim
         self.dropout = nn.Dropout(dropout)
 
-        # cat_features may be a dict (from rgtan_main) or a list of column names
         if isinstance(cat_features, dict):
             cat_cols = list(cat_features.keys())
         else:
             cat_cols = list(cat_features) if cat_features is not None else []
 
-        # Stable list
         self.cat_cols = [c for c in cat_cols if c not in {"Labels", "Time"}]
 
-        # Embedding tables
+        # Embedding tables for categorical cols
         self.cat_table = nn.ModuleDict()
         for col in self.cat_cols:
             max_id = int(df[col].max()) if (df is not None and col in df.columns) else 0
             self.cat_table[col] = nn.Embedding(max_id + 1, in_feats_dim).to(device)
 
-        # Per-cat small MLP
+        # Per-cat MLP layers sized to cat_cols (never None)
         self.forward_mlp = nn.ModuleList([nn.Linear(in_feats_dim, in_feats_dim) for _ in range(len(self.cat_cols))])
 
-        # Neighbor-stat encoder (only if dict non-empty)
+        # Neighbor-stat encoder only if dict non-empty
         self.nei_table = None
         if isinstance(neigh_features, dict) and len(neigh_features) > 0:
             self.nei_table = Tabular1DCNN2(input_dim=len(neigh_features), embed_dim=in_feats_dim)
 
-        # Attention for neighbor tokens
-        self.att_head_num = att_head_num
-        self.att_head_size = max(1, int(in_feats_dim / att_head_num))
+        # Attention to combine neighbor-stat tokens
+        self.att_head_num = max(1, int(att_head_num))
+        self.att_head_size = max(1, int(in_feats_dim / self.att_head_num))
         self.total_head_size = in_feats_dim
 
         self.lin_q = nn.Linear(in_feats_dim, self.total_head_size)
@@ -276,7 +263,7 @@ class TransEmbedding(nn.Module):
         # x: (B, T, D)
         B, T, D = x.shape
         H = self.att_head_num
-        Hd = int(D / H) if D % H == 0 else self.att_head_size
+        Hd = int(D / H) if (D % H == 0) else self.att_head_size
         x = x.view(B, T, H, Hd)
         return x.permute(0, 2, 1, 3)  # (B, H, T, Hd)
 
@@ -307,7 +294,8 @@ class TransEmbedding(nn.Module):
 
         out = self.lin_final(ctx)
         out = self.layer_norm(out)
-        # Aggregate across tokens -> (B, D)
+
+        # Aggregate over tokens -> (B, D)
         out = out.mean(dim=1)
         return out
 
@@ -360,7 +348,6 @@ class RGTAN(nn.Module):
         self.device = device
         self.gated = gated
 
-        # layers
         self.layers = nn.ModuleList()
 
         feat_drop = drop[0] if isinstance(drop, list) and len(drop) > 0 else float(drop)
@@ -398,7 +385,6 @@ class RGTAN(nn.Module):
         self.dropout = nn.Dropout(feat_drop)
         self.classifier = nn.Linear(hidden_dim * heads[-1], n_classes)
 
-        # categorical + neighbor-stat embedding helper
         self.trans_emb = TransEmbedding(
             df=ref_df,
             device=device,
@@ -409,27 +395,33 @@ class RGTAN(nn.Module):
             att_head_num=nei_att_head,
         )
 
-        # label embedding
+        # label embedding (labels expected: {0,1} plus padding idx 2)
         self.label_emb = nn.Embedding(3, hidden_dim * heads[-1]).to(device)
 
     def forward(self, blocks, x, y, x1, neigh_input=None):
-        # x: numeric features (B_all_nodes_in_block_src?) as provided by loader
-        # x1: categorical dict (src nodes)
-        # neigh_input: dict of neighbor stats or {} (src nodes)
-
+        # Add categorical embedding to numeric features for src nodes
         if isinstance(x1, dict):
             x_cat, _ = self.trans_emb(x1, neigh_input)
             x = x + x_cat
 
         h = x
 
-        # IMPORTANT: blocks[l] expects h sized to block.num_src_nodes()
-        # TransformerConv returns features sized to block.num_dst_nodes()
+        # Each block maps src -> dst; output h is always sized to dst nodes of that block
         for l in range(self.n_layers):
             h = self.layers[l](blocks[l], h)
             h = self.dropout(h)
 
-        # label embedding y corresponds to DST nodes for the last block output
+        # -----------------------------
+        # Backwards-compatible label alignment
+        # -----------------------------
+        # h is for dst nodes of the LAST block
+        # y must match that same dst node set length
+        if y is not None and isinstance(blocks, (list, tuple)) and len(blocks) > 0:
+            ndst = blocks[-1].num_dst_nodes()
+            if y.shape[0] != ndst:
+                # DGLBlock convention: dst nodes correspond to the first ndst nodes
+                y = y[:ndst]
+
         label_embed = self.label_emb(y)
         h = h + label_embed
 
