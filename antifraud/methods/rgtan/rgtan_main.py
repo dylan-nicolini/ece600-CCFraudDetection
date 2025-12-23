@@ -27,21 +27,13 @@ from . import *
 from .rgtan_lpa import load_lpa_subtensor
 from .rgtan_model import RGTAN
 
-# Optional Comet (safe if not installed)
 try:
     from comet_ml import Experiment
 except Exception:
     Experiment = None
 
 
-# -------------------------
-# Utilities
-# -------------------------
 def _ensure_self_loops(g: dgl.DGLGraph) -> dgl.DGLGraph:
-    """
-    Option A fix for DGL zero-in-degree nodes:
-    remove existing self-loops (if any), then add self-loops for all nodes.
-    """
     try:
         g = dgl.remove_self_loop(g)
     except Exception:
@@ -81,6 +73,7 @@ def _log_params_once(experiment, args, nei_att_head):
         experiment.log_parameters({
             "method": "rgtan",
             "dataset": args.get("dataset"),
+            "ieee_mode": args.get("ieee_mode", "auto"),
             "device": args.get("device"),
             "n_fold": args.get("n_fold"),
             "seed": args.get("seed"),
@@ -111,18 +104,9 @@ def _maybe_flush(experiment):
 
 
 # -------------------------
-# IEEE helpers
+# IEEE RAW helpers
 # -------------------------
 def _find_ieee_files(prefix_dir: str):
-    """
-    Locate IEEE-CIS files in common layouts.
-
-    Supported:
-      - data/train_transaction.csv + data/train_identity.csv
-      - data/IEEE/train_transaction.csv + data/IEEE/train_identity.csv
-      - data/ieee/train_transaction.csv + data/ieee/train_identity.csv
-      - data/ieee-fraud-detection/train_transaction.csv + train_identity.csv
-    """
     candidates = [
         (os.path.join(prefix_dir, "train_transaction.csv"), os.path.join(prefix_dir, "train_identity.csv")),
         (os.path.join(prefix_dir, "IEEE", "train_transaction.csv"), os.path.join(prefix_dir, "IEEE", "train_identity.csv")),
@@ -137,9 +121,6 @@ def _find_ieee_files(prefix_dir: str):
 
 
 def _read_ieee_from_zip(zip_path: str):
-    """
-    Read IEEE-CIS CSVs from a zip file without extracting.
-    """
     with zipfile.ZipFile(zip_path, "r") as z:
         names = z.namelist()
         tx_name = None
@@ -164,14 +145,10 @@ def _read_ieee_from_zip(zip_path: str):
     return tx, identity
 
 
-def _build_ieee_graph(df: pd.DataFrame,
-                      time_col: str = "TransactionDT",
-                      edge_per_trans: int = 3,
-                      max_group_size: int = 5000):
-    """
-    Build a transaction graph for IEEE by connecting transactions that share an entity value,
-    ordered by TransactionDT. Caps large groups to avoid edge explosion.
-    """
+def _build_ieee_raw_graph(df: pd.DataFrame,
+                          time_col: str = "TransactionDT",
+                          edge_per_trans: int = 3,
+                          max_group_size: int = 5000):
     if time_col not in df.columns:
         raise ValueError(f"IEEE dataframe missing required time column: {time_col}")
 
@@ -201,12 +178,10 @@ def _build_ieee_graph(df: pd.DataFrame,
                     if i + j < n:
                         src.append(sorted_idxs[i])
                         tgt.append(sorted_idxs[i + j])
-
         if src:
             alls.extend(src)
             allt.extend(tgt)
 
-    # fallback: chain by time if no edges
     if len(alls) == 0:
         gdf = df.sort_values(by=time_col)
         idxs = gdf.index.to_list()
@@ -215,7 +190,62 @@ def _build_ieee_graph(df: pd.DataFrame,
             allt.append(idxs[i + 1])
 
     g = dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(df))
-    return g, entity_cols
+    return g
+
+
+# -------------------------
+# IEEE NORM helpers
+# -------------------------
+def _find_ieee_norm_train(prefix_dir: str):
+    import glob
+    norm_dir = os.path.join(prefix_dir, "ieee_sffsd_like")
+    canonical = os.path.join(norm_dir, "ieee_sffsd_like_train.csv")
+    if os.path.exists(canonical):
+        return canonical
+    cands = sorted(glob.glob(os.path.join(norm_dir, "*train*.csv")))
+    return cands[0] if cands else None
+
+
+def _looks_like_ieee_norm(df: pd.DataFrame) -> bool:
+    required = {"Time", "Source", "Target", "Amount", "Location", "Type", "Labels"}
+    return required.issubset(set(df.columns))
+
+
+def _load_ieee_norm_df(norm_path: str) -> pd.DataFrame:
+    df = pd.read_csv(norm_path)
+    df = df.loc[:, ~df.columns.str.contains('Unnamed')]
+    if not _looks_like_ieee_norm(df):
+        raise ValueError(f"Normalized IEEE file does not have required columns. Found: {list(df.columns)}")
+    return df
+
+
+def _build_ieee_norm_graph(data: pd.DataFrame, edge_per_trans: int = 3) -> dgl.DGLGraph:
+    alls, allt = [], []
+    pair = ["Source", "Target", "Location", "Type"]
+
+    for column in pair:
+        src, tgt = [], []
+        for _, c_df in data.groupby(column):
+            c_df = c_df.sort_values(by="Time")
+            sorted_idxs = c_df.index.to_list()
+            n = len(sorted_idxs)
+            for i in range(n):
+                for j in range(1, edge_per_trans + 1):
+                    if i + j < n:
+                        src.append(sorted_idxs[i])
+                        tgt.append(sorted_idxs[i + j])
+        if src:
+            alls.extend(src)
+            allt.extend(tgt)
+
+    if len(alls) == 0:
+        gdf = data.sort_values(by="Time")
+        idxs = gdf.index.to_list()
+        for i in range(len(idxs) - 1):
+            alls.append(idxs[i])
+            allt.append(idxs[i + 1])
+
+    return dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(data))
 
 
 # -------------------------
@@ -233,27 +263,20 @@ def rgtan_main(
     nei_att_head,
     experiment: Experiment = None
 ):
-    """
-    RGTAN training loop with GTAN-style console logging and Comet epoch metrics.
-    """
     device = args["device"]
     graph = graph.to(device)
 
     _log_params_once(experiment, args, nei_att_head)
 
-    # Buffers for OOF and test predictions
     oof_predictions = torch.from_numpy(np.zeros([len(feat_df), 2])).float().to(device)
     test_predictions = torch.from_numpy(np.zeros([len(feat_df), 2])).float().to(device)
 
-    # K-fold
     kfold = StratifiedKFold(n_splits=args["n_fold"], shuffle=True, random_state=args["seed"])
     y_target = labels.iloc[train_idx].values
 
-    # Feature tensors
     num_feat = torch.from_numpy(feat_df.values).float().to(device)
     cat_feat = {col: torch.from_numpy(feat_df[col].values).long().to(device) for col in cat_features}
 
-    # Neighbor features (optional)
     neigh_padding_dict = {}
     if isinstance(neigh_features, pd.DataFrame):
         nei_feat = {
@@ -261,22 +284,19 @@ def rgtan_main(
             for col in neigh_features.columns
         }
     else:
-        nei_feat = {}   # ✅ empty dict, not list
+        nei_feat = {}  # IMPORTANT: dict, not list
 
-    # Labels tensor
     y_series = labels
     labels = torch.from_numpy(y_series.values).long().to(device)
 
     loss_fn = nn.CrossEntropyLoss().to(device)
 
     for fold, (trn_idx, val_idx) in enumerate(kfold.split(feat_df.iloc[train_idx], y_target)):
-        fold_no = fold + 1
-        print(f"Training fold {fold_no}", flush=True)
+        print(f"Training fold {fold + 1}", flush=True)
 
         trn_ind = torch.from_numpy(np.array(train_idx)[trn_idx]).long().to(device)
         val_ind = torch.from_numpy(np.array(train_idx)[val_idx]).long().to(device)
 
-        # Dataloaders
         train_sampler = MultiLayerFullNeighborSampler(args["n_layers"])
         train_dataloader = NodeDataLoader(
             graph,
@@ -303,7 +323,6 @@ def rgtan_main(
             num_workers=0,
         )
 
-        # Model
         model = RGTAN(
             in_feats=feat_df.shape[1],
             hidden_dim=args["hid_dim"] // 4,
@@ -320,18 +339,13 @@ def rgtan_main(
             nei_att_head=nei_att_head,
         ).to(device)
 
-        # Optim
         lr = args["lr"] * np.sqrt(args["batch_size"] / 1024)
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args["wd"])
         lr_scheduler = MultiStepLR(optimizer=optimizer, milestones=[4000, 12000], gamma=0.3)
 
         earlystoper = early_stopper(patience=args["early_stopping"], verbose=True)
 
-        # Epoch loop
         for epoch in range(args["max_epochs"]):
-            # -----------------------
-            # Train
-            # -----------------------
             model.train()
             train_loss_list = []
 
@@ -380,9 +394,6 @@ def rgtan_main(
 
             train_loss_epoch = float(np.mean(train_loss_list)) if train_loss_list else 0.0
 
-            # -----------------------
-            # Validation
-            # -----------------------
             model.eval()
             val_loss_sum = 0.0
             val_count = 0
@@ -432,7 +443,6 @@ def rgtan_main(
 
             val_loss_epoch = float(val_loss_sum / max(val_count, 1))
 
-            # Full-val metrics on val_ind
             val_scores = torch.softmax(oof_predictions[val_ind], dim=1)[:, 1].detach().cpu().numpy()
             val_labels_np = labels[val_ind].detach().cpu().numpy()
             m = val_labels_np != 2
@@ -442,7 +452,6 @@ def rgtan_main(
             val_ap_epoch = float(average_precision_score(val_labels_np, val_scores)) if len(val_labels_np) else float("nan")
             val_auc_epoch = _safe_auc(val_labels_np, val_scores)
 
-            # Comet per epoch
             _log_metric(experiment, "train_loss", train_loss_epoch, step=epoch)
             _log_metric(experiment, "val_loss", val_loss_epoch, step=epoch)
             _log_metric(experiment, "val_ap", val_ap_epoch, step=epoch)
@@ -456,9 +465,6 @@ def rgtan_main(
 
         print("Best val_loss is: {:.7f}".format(earlystoper.best_cv), flush=True)
 
-        # -----------------------
-        # Test inference (best model)
-        # -----------------------
         test_ind = torch.from_numpy(np.array(test_idx)).long().to(device)
         test_sampler = MultiLayerFullNeighborSampler(args["n_layers"])
         test_dataloader = NodeDataLoader(
@@ -489,9 +495,6 @@ def rgtan_main(
                 if step % 10 == 0:
                     print("In test batch:{:04d}".format(step), flush=True)
 
-    # -----------------------
-    # Final metrics
-    # -----------------------
     y_train = labels[train_idx].detach().cpu().numpy().copy()
     y_train[y_train == 2] = 0
     oof_scores = torch.softmax(oof_predictions, dim=1).detach().cpu().numpy()[train_idx, 1]
@@ -522,10 +525,7 @@ def rgtan_main(
     _maybe_flush(experiment)
 
 
-# -------------------------
-# Data loaders
-# -------------------------
-def loda_rgtan_data(dataset: str, test_size: float):
+def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
     """
     Returns:
       feat_data (pd.DataFrame),
@@ -543,27 +543,27 @@ def loda_rgtan_data(dataset: str, test_size: float):
 
         df = pd.read_csv(prefix + "S-FFSDneofull.csv")
         df = df.loc[:, ~df.columns.str.contains('Unnamed')]
-
         data = df[df["Labels"] <= 2].reset_index(drop=True)
 
         alls, allt = [], []
         pair = ["Source", "Target", "Location", "Type"]
+        edge_per_trans = 3
 
         for column in pair:
             src, tgt = [], []
-            edge_per_trans = 3
             for _, c_df in tqdm(data.groupby(column), desc=column):
                 c_df = c_df.sort_values(by="Time")
-                df_len = len(c_df)
-                sorted_idxs = c_df.index
-                src.extend([sorted_idxs[i] for i in range(df_len)
-                            for j in range(edge_per_trans) if i + j < df_len])
-                tgt.extend([sorted_idxs[i + j] for i in range(df_len)
-                            for j in range(edge_per_trans) if i + j < df_len])
+                sorted_idxs = c_df.index.to_list()
+                n = len(sorted_idxs)
+                for i in range(n):
+                    for j in range(1, edge_per_trans + 1):
+                        if i + j < n:
+                            src.append(sorted_idxs[i])
+                            tgt.append(sorted_idxs[i + j])
             alls.extend(src)
             allt.extend(tgt)
 
-        g = dgl.graph((np.array(alls), np.array(allt)))
+        g = dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(data))
         g = _ensure_self_loops(g)
 
         for col in ["Source", "Target", "Location", "Type"]:
@@ -587,89 +587,125 @@ def loda_rgtan_data(dataset: str, test_size: float):
             random_state=2, shuffle=True
         )
 
-        # Neighbor features (as in original S-FFSD flow)
         neigh_features = []
         neigh_path = prefix + "S-FFSD_neigh_feat.csv"
         if os.path.exists(neigh_path):
             neigh_features = pd.read_csv(neigh_path)
             print("neighborhood feature loaded for nn input.", flush=True)
 
-    elif dataset in ("IEEE", "IEEE-CIS", "ieee", "ieeecis"):
-        cat_features = []
-        neigh_features = []  # optional; keep empty unless you generate a neighbor-feature table
+    elif str(dataset).lower() in ("ieee", "ieee-cis", "ieeecis"):
+        ieee_mode = (ieee_mode or "auto").lower()
 
-        zip_path = os.path.join(prefix, "ieee-fraud-detection.zip")
-        tx_path, id_path = _find_ieee_files(prefix)
+        norm_path = _find_ieee_norm_train(prefix)
+        can_use_norm = False
+        if norm_path and os.path.exists(norm_path):
+            try:
+                tmp = pd.read_csv(norm_path, nrows=5)
+                can_use_norm = _looks_like_ieee_norm(tmp)
+            except Exception:
+                can_use_norm = False
 
-        if os.path.exists(zip_path):
-            tx, identity = _read_ieee_from_zip(zip_path)
-        elif tx_path is not None:
-            tx = pd.read_csv(tx_path)
-            identity = pd.read_csv(id_path) if id_path is not None else None
-        else:
-            raise FileNotFoundError(
-                "IEEE dataset not found. Place either:\n"
-                f"  - {zip_path}\n"
-                "  - data/train_transaction.csv (+ train_identity.csv)\n"
-                "  - data/IEEE/train_transaction.csv (+ train_identity.csv)\n"
+        use_norm = (ieee_mode == "norm") or (ieee_mode == "auto" and can_use_norm)
+
+        if use_norm:
+            # --- Normalized IEEE (S-FFSD-like) ---
+            cat_features = ["Target", "Location", "Type"]
+            neigh_features = []
+
+            df = _load_ieee_norm_df(norm_path)
+            data = df[df["Labels"] <= 2].reset_index(drop=True)
+
+            g = _build_ieee_norm_graph(data, edge_per_trans=3)
+            g = _ensure_self_loops(g)
+
+            for col in ["Source", "Target", "Location", "Type"]:
+                le = LabelEncoder()
+                data[col] = le.fit_transform(data[col].apply(str).values)
+
+            feat_data = data.drop("Labels", axis=1)
+            labels = data["Labels"]
+
+            g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+            g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
+
+            try:
+                dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE-norm.bin"), [g])
+            except Exception:
+                pass
+
+            index = list(range(len(labels)))
+            train_idx, test_idx, _, _ = train_test_split(
+                index, labels, stratify=labels, test_size=test_size,
+                random_state=2, shuffle=True
             )
 
-        # merge identity if present
-        if identity is not None and "TransactionID" in tx.columns and "TransactionID" in identity.columns:
-            df = tx.merge(identity, on="TransactionID", how="left")
         else:
-            df = tx.copy()
+            # --- Raw IEEE (transaction-only) ---
+            cat_features = []
+            neigh_features = []
 
-        if "isFraud" not in df.columns:
-            raise ValueError("IEEE train_transaction.csv must include 'isFraud' column")
+            zip_path = os.path.join(prefix, "ieee-fraud-detection.zip")
+            tx_path, _ = _find_ieee_files(prefix)
 
-        labels = df["isFraud"].astype(int)
-
-        # drop obvious non-features
-        drop_cols = [c for c in ["TransactionID"] if c in df.columns]
-        feat_df = df.drop(columns=drop_cols)
-
-        # Build graph + self loops (Option A)
-        g, _ = _build_ieee_graph(
-            feat_df, time_col="TransactionDT", edge_per_trans=3, max_group_size=5000
-        )
-        g = _ensure_self_loops(g)
-
-        # Encode object columns as categorical
-        obj_cols = [c for c in feat_df.columns if feat_df[c].dtype == "object"]
-        for col in obj_cols:
-            le = LabelEncoder()
-            feat_df[col] = le.fit_transform(feat_df[col].astype(str).fillna("NA").values)
-            cat_features.append(col)
-
-        # Fill numeric NaNs
-        for col in feat_df.columns:
-            if col in cat_features:
-                feat_df[col] = feat_df[col].fillna(0).astype(int)
+            if os.path.exists(zip_path):
+                tx, _identity = _read_ieee_from_zip(zip_path)
+            elif tx_path is not None:
+                tx = pd.read_csv(tx_path)
             else:
-                if pd.api.types.is_numeric_dtype(feat_df[col]):
-                    med = feat_df[col].median()
-                    if pd.isna(med):
-                        med = 0.0
-                    feat_df[col] = feat_df[col].fillna(med)
+                raise FileNotFoundError(
+                    "IEEE dataset not found. Place either:\n"
+                    f"  - {zip_path}\n"
+                    "  - data/train_transaction.csv\n"
+                    "  - data/IEEE/train_transaction.csv\n"
+                    "  - data/ieee/train_transaction.csv\n"
+                    "  - data/ieee-fraud-detection/train_transaction.csv\n"
+                )
+
+            df = tx.copy()
+            if "isFraud" not in df.columns:
+                raise ValueError("IEEE train_transaction.csv must include 'isFraud' column")
+
+            labels = df["isFraud"].astype(int)
+
+            drop_cols = [c for c in ["TransactionID", "isFraud"] if c in df.columns]
+            feat_df = df.drop(columns=drop_cols)
+
+            g = _build_ieee_raw_graph(feat_df, time_col="TransactionDT", edge_per_trans=3, max_group_size=5000)
+            g = _ensure_self_loops(g)
+
+            obj_cols = [c for c in feat_df.columns if feat_df[c].dtype == "object"]
+            for col in obj_cols:
+                le = LabelEncoder()
+                feat_df[col] = le.fit_transform(feat_df[col].astype(str).fillna("NA").values)
+                cat_features.append(col)
+
+            for col in feat_df.columns:
+                if col in cat_features:
+                    feat_df[col] = feat_df[col].fillna(0).astype(int)
                 else:
-                    feat_df[col] = feat_df[col].fillna(0)
+                    if pd.api.types.is_numeric_dtype(feat_df[col]):
+                        med = feat_df[col].median()
+                        if pd.isna(med):
+                            med = 0.0
+                        feat_df[col] = feat_df[col].fillna(med)
+                    else:
+                        feat_df[col] = feat_df[col].fillna(0)
 
-        g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
-        g.ndata['feat'] = torch.from_numpy(feat_df.to_numpy()).to(torch.float32)
+            g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+            g.ndata['feat'] = torch.from_numpy(feat_df.to_numpy()).to(torch.float32)
 
-        try:
-            dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE.bin"), [g])
-        except Exception:
-            pass
+            try:
+                dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE-raw.bin"), [g])
+            except Exception:
+                pass
 
-        index = list(range(len(labels)))
-        train_idx, test_idx, _, _ = train_test_split(
-            index, labels, stratify=labels, test_size=test_size,
-            random_state=2, shuffle=True
-        )
+            index = list(range(len(labels)))
+            train_idx, test_idx, _, _ = train_test_split(
+                index, labels, stratify=labels, test_size=test_size,
+                random_state=2, shuffle=True
+            )
 
-        feat_data = feat_df
+            feat_data = feat_df
 
     elif dataset == 'yelp':
         cat_features = []
@@ -694,7 +730,7 @@ def loda_rgtan_data(dataset: str, test_size: float):
                 src.append(i)
                 tgt.append(j)
 
-        g = dgl.graph((np.array(src), np.array(tgt)))
+        g = dgl.graph((np.array(src), np.array(tgt)), num_nodes=len(labels))
         g = _ensure_self_loops(g)
 
         g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
@@ -735,7 +771,7 @@ def loda_rgtan_data(dataset: str, test_size: float):
                 src.append(i)
                 tgt.append(j)
 
-        g = dgl.graph((np.array(src), np.array(tgt)))
+        g = dgl.graph((np.array(src), np.array(tgt)), num_nodes=len(labels))
         g = _ensure_self_loops(g)
 
         g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)

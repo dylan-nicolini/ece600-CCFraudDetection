@@ -22,13 +22,12 @@ def init_comet(args: dict):
     """
     Create ONE Comet experiment per run.
 
-    Requires these env vars:
+    Requires env vars:
       - COMET_API_KEY
       - COMET_WORKSPACE
-      - COMET_PROJECT_NAME (optional; default used if missing)
+      - COMET_PROJECT_NAME (optional)
 
-    Returns:
-      - Experiment instance, or None if disabled/missing deps.
+    Returns Experiment or None.
     """
     if Experiment is None:
         return None
@@ -47,7 +46,6 @@ def init_comet(args: dict):
         disabled=(os.getenv("COMET_API_KEY") is None),
     )
 
-    # Helpful metadata
     try:
         exp.set_name(f"{args.get('method', 'run')}-{args.get('dataset', 'na')}-seed{args.get('seed', 'na')}")
         exp.add_tag(str(args.get("method", "unknown")))
@@ -61,12 +59,7 @@ def init_comet(args: dict):
 
 
 def log_comet_status(experiment):
-    """
-    Print Comet status diagnostics immediately at startup,
-    so you can confirm the experiment should appear in Comet UI.
-    """
     print("----- COMET STATUS -----")
-
     api_key = os.getenv("COMET_API_KEY")
     workspace = os.getenv("COMET_WORKSPACE")
     project = os.getenv("COMET_PROJECT_NAME")
@@ -86,17 +79,29 @@ def log_comet_status(experiment):
             print("Experiment disabled:", experiment.disabled)
         except Exception:
             print("Experiment disabled: (unknown)")
-
     print("------------------------")
 
 
 def parse_args():
+    """
+    Loads the method's YAML config, then applies optional CLI overrides:
+      python main.py --method gtan --dataset IEEE --ieee-mode auto
+    """
     parser = ArgumentParser(
         formatter_class=ArgumentDefaultsHelpFormatter,
         conflict_handler="resolve"
     )
-    parser.add_argument("--method", default=str)  # specify which method to use
-    method = vars(parser.parse_args())["method"]
+    parser.add_argument("--method", required=True)
+    parser.add_argument("--dataset", default=None, help="Optional override for dataset in YAML (e.g., IEEE)")
+    parser.add_argument(
+        "--ieee-mode",
+        default="auto",
+        choices=["auto", "raw", "norm"],
+        help="IEEE loader mode: raw=original train_transaction.csv; norm=S-FFSD-like 7-col file; auto=prefer norm if present."
+    )
+
+    args_cli = vars(parser.parse_args())
+    method = args_cli["method"]
 
     if method in ["mcnn"]:
         yaml_file = "config/mcnn_cfg.yaml"
@@ -119,6 +124,14 @@ def parse_args():
         args = yaml.safe_load(file)
 
     args["method"] = method
+
+    # Apply dataset override if passed
+    if args_cli.get("dataset"):
+        args["dataset"] = args_cli["dataset"]
+
+    # Always store ieee mode (even if dataset isn't IEEE)
+    args["ieee_mode"] = args_cli.get("ieee_mode", "auto")
+
     return args
 
 
@@ -131,7 +144,6 @@ def base_load_data(args: dict):
     feat_df = pd.read_csv(data_path)
     train_size = 1 - args["test_size"]
 
-    # for ICONIP16 & AAAI20
     if args["method"] == "stan":
         if os.path.exists("data/tel_3d.npy"):
             return
@@ -162,10 +174,37 @@ def base_load_data(args: dict):
     np.save(tel_file, tel)
 
 
+def _resolve_nei_att_head(args: dict):
+    """
+    Fix for KeyError when args["nei_att_heads"][args["dataset"]] doesn't exist.
+    - Try exact key
+    - Try upper/lower variants
+    - Fall back to S-FFSD
+    - Fall back to first dict value
+    """
+    heads = args.get("nei_att_heads", {})
+    ds = args.get("dataset")
+
+    if not isinstance(heads, dict) or not heads:
+        return None
+
+    if ds in heads:
+        return heads[ds]
+
+    if isinstance(ds, str):
+        if ds.upper() in heads:
+            return heads[ds.upper()]
+        if ds.lower() in heads:
+            return heads[ds.lower()]
+
+    if "S-FFSD" in heads:
+        return heads["S-FFSD"]
+
+    return next(iter(heads.values()))
+
+
 def main(args):
     experiment = init_comet(args)
-
-    # 🔍 Startup diagnostics: you should see these BEFORE training
     log_comet_status(experiment)
 
     try:
@@ -232,11 +271,14 @@ def main(args):
 
         elif args["method"] == "gtan":
             from methods.gtan.gtan_main import gtan_main, load_gtan_data
+
             feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
-                args["dataset"], args["test_size"]
+                args["dataset"],
+                args["test_size"],
+                ieee_mode=args.get("ieee_mode", "auto")
             )
 
-            # ✅ Pass Comet experiment if gtan_main supports it; else fall back.
+            # Pass Comet if supported
             try:
                 gtan_main(feat_data, g, train_idx, test_idx, labels, args, cat_features, experiment=experiment)
             except TypeError:
@@ -246,17 +288,24 @@ def main(args):
             from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
 
             feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
-                args["dataset"], args["test_size"]
+                args["dataset"],
+                args["test_size"],
+                ieee_mode=args.get("ieee_mode", "auto")
             )
 
-            # Enforce GTAN-standard Comet logging for RGTAN (no silent fallback)
+            nei_att_head = _resolve_nei_att_head(args)
+            if nei_att_head is None:
+                raise KeyError(
+                    f"nei_att_heads missing/empty; cannot resolve for dataset '{args.get('dataset')}'. "
+                    "Fix config/rgtan_cfg.yaml (nei_att_heads) or provide a default."
+                )
+
             rgtan_main(
                 feat_data, g, train_idx, test_idx, labels, args,
                 cat_features, neigh_features,
-                nei_att_head=args["nei_att_heads"][args["dataset"]],
+                nei_att_head=nei_att_head,
                 experiment=experiment
             )
-
 
         elif args["method"] == "hogrl":
             from methods.hogrl.hogrl_main import hogrl_main
