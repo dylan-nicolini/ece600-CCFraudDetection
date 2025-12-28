@@ -625,6 +625,16 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             feat_data = data.drop("Labels", axis=1)
             labels = data["Labels"]
 
+            # --- FIX: encode any remaining object/string columns for IEEE norm so Torch can convert ---
+            obj_cols = [c for c in feat_data.columns if feat_data[c].dtype == "object"]
+            for col in obj_cols:
+                feat_data[col] = feat_data[col].astype(str).fillna("NA")
+                feat_data[col] = feat_data[col].astype("category").cat.codes
+                if col not in cat_features:
+                    cat_features.append(col)
+
+            feat_data = feat_data.apply(pd.to_numeric, errors="coerce").fillna(0)
+
             g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
             g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
@@ -715,6 +725,9 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
         labels = pd.DataFrame(data_file['label'].flatten())[0]
         feat_data = pd.DataFrame(data_file['features'].todense().A)
 
+        with open(prefix + 'YelpChi.mat', 'rb') as file:
+            pass
+
         with open(prefix + 'yelp_homo_adjlists.pickle', 'rb') as file:
             homo = pickle.load(file)
 
@@ -755,6 +768,9 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
         data_file = loadmat(prefix + 'Amazon.mat')
         labels = pd.DataFrame(data_file['label'].flatten())[0]
         feat_data = pd.DataFrame(data_file['features'].todense().A)
+
+        with open(prefix + 'Amazon.mat', 'rb') as file:
+            pass
 
         with open(prefix + 'amz_homo_adjlists.pickle', 'rb') as file:
             homo = pickle.load(file)
