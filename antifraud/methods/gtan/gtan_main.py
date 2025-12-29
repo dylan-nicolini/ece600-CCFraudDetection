@@ -18,57 +18,21 @@ try:
 except ImportError:
     from dgl.dataloading import DataLoader as NodeDataLoader
 
-from torch.optim.lr_scheduler import MultiStepLR
-
-from .gtan_model import GraphAttnModel
-from .gtan_lpa import load_lpa_subtensor
-from . import *
-
-try:
-    from comet_ml import Experiment
-except Exception:
-    Experiment = None
+from sklearn.metrics import confusion_matrix
 
 
-def _ensure_self_loops(g: dgl.DGLGraph) -> dgl.DGLGraph:
-    try:
-        g = dgl.remove_self_loop(g)
-    except Exception:
-        pass
-    try:
-        g = dgl.add_self_loop(g)
-    except Exception:
-        pass
-    return g
+def train(args, graph, feat_df, labels, train_idx, test_idx, cat_features=None, experiment=None):
+    """Training process for GTAN."""
+    if cat_features is None:
+        cat_features = []
 
+    in_size = feat_df.shape[1]
+    num_classes = 2
 
-def _log_graph_file(graph_path: str, tag: str):
-    exists = os.path.exists(graph_path)
-    size = os.path.getsize(graph_path) if exists else 0
-    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(graph_path))) if exists else "N/A"
-    print(f"[IEEE GRAPH] {tag} path={graph_path} exists={exists} size_bytes={size} mtime={mtime}")
+    # device
+    device = torch.device(args['device'])
 
-
-def _log_graph_stats(g: dgl.DGLGraph, tag: str):
-    try:
-        n_nodes = int(g.num_nodes())
-        n_edges = int(g.num_edges())
-        print(f"[IEEE GRAPH] {tag} stats: nodes={n_nodes:,} edges={n_edges:,}")
-        if hasattr(g, "ndata") and "label" in g.ndata:
-            y = g.ndata["label"]
-            try:
-                y_np = y.detach().cpu().numpy()
-                pos = int((y_np == 1).sum())
-                tot = int(y_np.shape[0])
-                print(f"[IEEE GRAPH] {tag} labels: pos={pos:,} rate={pos / max(tot, 1):.6f}")
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[IEEE GRAPH] {tag} stats: unable to compute ({e})")
-
-
-def gtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, experiment: Experiment = None):
-    device = args['device']
+    # graph
     graph = graph.to(device)
 
     oof_predictions = torch.from_numpy(np.zeros([len(feat_df), 2])).float().to(device)
@@ -85,260 +49,212 @@ def gtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, e
 
     loss_fn = nn.CrossEntropyLoss().to(device)
 
-    if experiment is not None:
-        try:
-            experiment.log_parameters({
-                "method": "gtan",
-                "dataset": args.get("dataset"),
-                "ieee_mode": args.get("ieee_mode", "auto"),
-                "device": args.get("device"),
-                "n_fold": args.get("n_fold"),
-                "seed": args.get("seed"),
-                "batch_size": args.get("batch_size"),
-                "n_layers": args.get("n_layers"),
-                "hid_dim": args.get("hid_dim"),
-                "dropout": args.get("dropout"),
-                "gated": args.get("gated"),
-                "lr_base": args.get("lr"),
-                "wd": args.get("wd"),
-                "early_stopping": args.get("early_stopping"),
-                "max_epochs": args.get("max_epochs"),
-                "test_size": args.get("test_size"),
-            })
-        except Exception:
-            pass
+    # Training fold
+    for fold, (trn_idx, val_idx) in enumerate(kfold.split(train_idx, y_target)):
+        print(f"Training fold {fold + 1}", flush=True)
 
-    for fold, (trn_idx, val_idx) in enumerate(kfold.split(feat_df.iloc[train_idx], y_target)):
-        print(f'Training fold {fold + 1}')
-
-        trn_ind = torch.from_numpy(np.array(train_idx)[trn_idx]).long().to(device)
-        val_ind = torch.from_numpy(np.array(train_idx)[val_idx]).long().to(device)
-
-        train_sampler = MultiLayerFullNeighborSampler(args['n_layers'])
-        train_dataloader = NodeDataLoader(
-            graph,
-            trn_ind,
-            train_sampler,
-            device=device,
-            use_ddp=False,
+        # prepare dataloader
+        sampler = MultiLayerFullNeighborSampler(args['n_layers'])
+        dataloader = NodeDataLoader(
+            graph, train_idx[trn_idx], sampler,
             batch_size=args['batch_size'],
             shuffle=True,
             drop_last=False,
             num_workers=0
         )
 
-        val_sampler = MultiLayerFullNeighborSampler(args['n_layers'])
-        val_dataloader = NodeDataLoader(
-            graph,
-            val_ind,
-            val_sampler,
-            use_ddp=False,
+        # model
+        from .models import GTAN
+        model = GTAN(
+            in_size=in_size,
+            hidden_size=args['hid_dim'],
+            num_classes=num_classes,
+            num_layers=args['n_layers'],
+            dropout=args['dropout'],
             device=device,
-            batch_size=args['batch_size'],
-            shuffle=True,
-            drop_last=False,
-            num_workers=0,
-        )
-
-        model = GraphAttnModel(
-            in_feats=feat_df.shape[1],
-            hidden_dim=args['hid_dim'] // 4,
-            n_classes=2,
-            heads=[4] * args['n_layers'],
-            activation=nn.PReLU(),
-            n_layers=args['n_layers'],
-            drop=args['dropout'],
-            device=device,
-            gated=args['gated'],
-            ref_df=feat_df,
-            cat_features=cat_feat
+            gated=args['gated']
         ).to(device)
 
-        lr = args['lr'] * np.sqrt(args['batch_size'] / 1024)
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args['wd'])
-        lr_scheduler = MultiStepLR(optimizer=optimizer, milestones=[4000, 12000], gamma=0.3)
+        optimizer = optim.Adam(model.parameters(), lr=args['lr'], weight_decay=args['wd'])
 
-        earlystoper = early_stopper(patience=args['early_stopping'], verbose=True)
+        best_val_auc = 0
+        best_val_ap = 0
+        best_val_f1 = 0
+        early_stop_cnt = 0
 
+        # training epochs
         for epoch in range(args['max_epochs']):
-            train_loss_list = []
             model.train()
+            train_loss_list = []
+            train_auc_list, train_ap_list, train_acc_list = [], [], []
 
-            for step, (input_nodes, seeds, blocks) in enumerate(train_dataloader):
-                batch_inputs, batch_work_inputs, batch_labels, lpa_labels = load_lpa_subtensor(
-                    num_feat, cat_feat, labels, seeds, input_nodes, device
-                )
+            for batch_id, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
+                blocks = [b.to(device) for b in blocks]
+                batch_feat = num_feat[input_nodes]
+                batch_labels = labels[output_nodes]
 
-                blocks = [block.to(device) for block in blocks]
-                train_batch_logits = model(blocks, batch_inputs, lpa_labels, batch_work_inputs)
-
-                mask = batch_labels == 2
-                train_batch_logits = train_batch_logits[~mask]
-                batch_labels = batch_labels[~mask]
-
-                train_loss = loss_fn(train_batch_logits, batch_labels)
+                logits = model(blocks, batch_feat, {k: v[input_nodes] for k, v in cat_feat.items()})
+                loss = loss_fn(logits, batch_labels)
 
                 optimizer.zero_grad()
-                train_loss.backward()
+                loss.backward()
                 optimizer.step()
-                lr_scheduler.step()
 
-                train_loss_list.append(float(train_loss.detach().cpu().numpy()))
+                # stats
+                prob = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+                y_true = batch_labels.detach().cpu().numpy()
 
-                if step % 10 == 0:
-                    tr_batch_pred = (
-                        torch.sum(torch.argmax(train_batch_logits.detach(), dim=1) == batch_labels)
-                        / batch_labels.shape[0]
-                    )
-                    score = torch.softmax(train_batch_logits.detach(), dim=1)[:, 1].cpu().numpy()
+                train_auc = roc_auc_score(y_true, prob) if len(np.unique(y_true)) > 1 else 0.0
+                train_ap = average_precision_score(y_true, prob) if len(np.unique(y_true)) > 1 else 0.0
+                pred = (prob >= 0.5).astype(int)
+                train_acc = (pred == y_true).mean()
 
-                    try:
-                        print(
-                            'In epoch:{:03d}|batch:{:04d}, train_loss:{:4f}, '
-                            'train_ap:{:.4f}, train_acc:{:.4f}, train_auc:{:.4f}'.format(
-                                epoch, step,
-                                float(np.mean(train_loss_list)),
-                                average_precision_score(batch_labels.cpu().numpy(), score),
-                                tr_batch_pred.detach(),
-                                roc_auc_score(batch_labels.cpu().numpy(), score)
-                            )
-                        )
-                    except Exception:
-                        pass
+                train_loss_list.append(loss.item())
+                train_auc_list.append(train_auc)
+                train_ap_list.append(train_ap)
+                train_acc_list.append(train_acc)
 
+                if batch_id % 10 == 0:
+                    print(f"In epoch:{epoch:03d}|batch:{batch_id:04d}, "
+                          f"train_loss:{np.mean(train_loss_list):.6f}, "
+                          f"train_ap:{np.mean(train_ap_list):.4f}, "
+                          f"train_acc:{np.mean(train_acc_list):.4f}, "
+                          f"train_auc:{np.mean(train_auc_list):.4f}", flush=True)
+
+            # validation
+            model.eval()
+            val_nodes = train_idx[val_idx]
+
+            val_sampler = MultiLayerFullNeighborSampler(args['n_layers'])
+            val_loader = NodeDataLoader(
+                graph, val_nodes, val_sampler,
+                batch_size=args['batch_size'],
+                shuffle=False,
+                drop_last=False,
+                num_workers=0
+            )
+
+            val_loss_list = []
+            val_auc_list, val_ap_list = [], []
+
+            with torch.no_grad():
+                for batch_id, (in_nodes, out_nodes, blocks) in enumerate(val_loader):
+                    blocks = [b.to(device) for b in blocks]
+                    batch_feat = num_feat[in_nodes]
+                    batch_labels = labels[out_nodes]
+
+                    logits = model(blocks, batch_feat, {k: v[in_nodes] for k, v in cat_feat.items()})
+                    loss = loss_fn(logits, batch_labels)
+                    val_loss_list.append(loss.item())
+
+                    prob = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+                    y_true = batch_labels.detach().cpu().numpy()
+
+                    val_auc = roc_auc_score(y_true, prob) if len(np.unique(y_true)) > 1 else 0.0
+                    val_ap = average_precision_score(y_true, prob) if len(np.unique(y_true)) > 1 else 0.0
+
+                    val_auc_list.append(val_auc)
+                    val_ap_list.append(val_ap)
+
+                    if batch_id % 10 == 0:
+                        print(f"In epoch:{epoch:03d}|batch:{batch_id:04d}, "
+                              f"val_loss:{np.mean(val_loss_list):.6f}, "
+                              f"val_ap:{np.mean(val_ap_list):.4f}, "
+                              f"val_auc:{np.mean(val_auc_list):.4f}", flush=True)
+
+            val_loss = float(np.mean(val_loss_list)) if val_loss_list else 0.0
+            val_auc = float(np.mean(val_auc_list)) if val_auc_list else 0.0
+            val_ap = float(np.mean(val_ap_list)) if val_ap_list else 0.0
+
+            # log to comet
             if experiment is not None:
                 try:
                     experiment.log_metric("train_loss", float(np.mean(train_loss_list)), step=epoch)
+                    experiment.log_metric("train_auc", float(np.mean(train_auc_list)), step=epoch)
+                    experiment.log_metric("train_ap", float(np.mean(train_ap_list)), step=epoch)
+                    experiment.log_metric("val_loss", val_loss, step=epoch)
+                    experiment.log_metric("val_auc", val_auc, step=epoch)
+                    experiment.log_metric("val_ap", val_ap, step=epoch)
                 except Exception:
                     pass
 
-            val_loss_sum = 0.0
-            val_count = 0
-            model.eval()
+            # early stopping based on AP (you can change to AUC if desired)
+            improved = val_ap > best_val_ap
+            if improved:
+                best_val_ap = val_ap
+                best_val_auc = val_auc
+                early_stop_cnt = 0
+                # Save best model for fold
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            else:
+                early_stop_cnt += 1
 
-            with torch.no_grad():
-                for step, (input_nodes, seeds, blocks) in enumerate(val_dataloader):
-                    batch_inputs, batch_work_inputs, batch_labels, lpa_labels = load_lpa_subtensor(
-                        num_feat, cat_feat, labels, seeds, input_nodes, device
-                    )
-
-                    blocks = [block.to(device) for block in blocks]
-                    val_batch_logits = model(blocks, batch_inputs, lpa_labels, batch_work_inputs)
-
-                    oof_predictions[seeds] = val_batch_logits
-
-                    mask = batch_labels == 2
-                    val_batch_logits = val_batch_logits[~mask]
-                    batch_labels = batch_labels[~mask]
-
-                    loss_val = loss_fn(val_batch_logits, batch_labels)
-                    bs = int(batch_labels.shape[0])
-
-                    val_loss_sum += float(loss_val.detach().cpu().numpy()) * bs
-                    val_count += bs
-
-                    if step % 10 == 0:
-                        score = torch.softmax(val_batch_logits.detach(), dim=1)[:, 1].cpu().numpy()
-                        try:
-                            print(
-                                'In epoch:{:03d}|batch:{:04d}, val_loss:{:4f}, val_ap:{:.4f}, '
-                                'val_auc:{:.4f}'.format(
-                                    epoch, step,
-                                    (val_loss_sum / max(val_count, 1)),
-                                    average_precision_score(batch_labels.cpu().numpy(), score),
-                                    roc_auc_score(batch_labels.cpu().numpy(), score)
-                                )
-                            )
-                        except Exception:
-                            pass
-
-            val_loss_epoch = val_loss_sum / max(val_count, 1)
-
-            if experiment is not None:
-                try:
-                    experiment.log_metric("val_loss", float(val_loss_epoch), step=epoch)
-
-                    val_scores = torch.softmax(oof_predictions[val_ind], dim=1)[:, 1].detach().cpu().numpy()
-                    val_labels_np = labels[val_ind].detach().cpu().numpy()
-
-                    mask = val_labels_np != 2
-                    val_scores = val_scores[mask]
-                    val_labels_np = val_labels_np[mask]
-
-                    if len(np.unique(val_labels_np)) > 1:
-                        experiment.log_metric("val_auc", float(roc_auc_score(val_labels_np, val_scores)), step=epoch)
-                    experiment.log_metric("val_ap", float(average_precision_score(val_labels_np, val_scores)), step=epoch)
-                except Exception:
-                    pass
-
-            earlystoper.earlystop(val_loss_epoch, model)
-            if earlystoper.is_earlystop:
-                print("Early Stopping!")
+            if early_stop_cnt >= args.get('early_stopping', 10):
+                print(f"Early stopping at epoch={epoch} (best_val_ap={best_val_ap:.6f})", flush=True)
                 break
 
-        print("Best val_loss is: {:.7f}".format(earlystoper.best_cv))
+        # restore best
+        if 'best_state' in locals():
+            model.load_state_dict(best_state)
 
-        test_ind = torch.from_numpy(np.array(test_idx)).long().to(device)
-        test_sampler = MultiLayerFullNeighborSampler(args['n_layers'])
-        test_dataloader = NodeDataLoader(
-            graph,
-            test_ind,
-            test_sampler,
-            use_ddp=False,
-            device=device,
+        # predict OOF on full train_idx fold split
+        model.eval()
+        all_nodes = train_idx
+        all_sampler = MultiLayerFullNeighborSampler(args['n_layers'])
+        all_loader = NodeDataLoader(
+            graph, all_nodes, all_sampler,
             batch_size=args['batch_size'],
-            shuffle=True,
+            shuffle=False,
             drop_last=False,
-            num_workers=0,
+            num_workers=0
         )
 
-        b_model = earlystoper.best_model.to(device)
-        b_model.eval()
         with torch.no_grad():
-            for step, (input_nodes, seeds, blocks) in enumerate(test_dataloader):
-                batch_inputs, batch_work_inputs, batch_labels, lpa_labels = load_lpa_subtensor(
-                    num_feat, cat_feat, labels, seeds, input_nodes, device
-                )
+            for in_nodes, out_nodes, blocks in all_loader:
+                blocks = [b.to(device) for b in blocks]
+                batch_feat = num_feat[in_nodes]
+                logits = model(blocks, batch_feat, {k: v[in_nodes] for k, v in cat_feat.items()})
+                probs = torch.softmax(logits, dim=1)
+                oof_predictions[out_nodes] = probs
 
-                blocks = [block.to(device) for block in blocks]
-                test_batch_logits = b_model(blocks, batch_inputs, lpa_labels, batch_work_inputs)
-                test_predictions[seeds] = test_batch_logits
-
-                if step % 10 == 0:
-                    print('In test batch:{:04d}'.format(step))
-
-    mask = y_target == 2
-    y_target[mask] = 0
-
-    my_ap = average_precision_score(
-        y_target,
-        torch.softmax(oof_predictions, dim=1).detach().cpu().numpy()[train_idx, 1]
+    # final evaluation on test split
+    test_nodes = test_idx
+    test_sampler = MultiLayerFullNeighborSampler(args['n_layers'])
+    test_loader = NodeDataLoader(
+        graph, test_nodes, test_sampler,
+        batch_size=args['batch_size'],
+        shuffle=False,
+        drop_last=False,
+        num_workers=0
     )
-    print("NN out of fold AP is:", my_ap)
 
-    if experiment is not None:
-        try:
-            experiment.log_metric("oof_ap", float(my_ap))
-        except Exception:
-            pass
+    model.eval()
+    test_probs = []
+    test_true = []
 
-    test_score = torch.softmax(test_predictions, dim=1)[test_idx, 1].detach().cpu().numpy()
-    y_test = labels[test_idx].detach().cpu().numpy()
-    test_pred = torch.argmax(test_predictions, dim=1)[test_idx].detach().cpu().numpy()
+    with torch.no_grad():
+        for in_nodes, out_nodes, blocks in test_loader:
+            blocks = [b.to(device) for b in blocks]
+            batch_feat = num_feat[in_nodes]
+            logits = model(blocks, batch_feat, {k: v[in_nodes] for k, v in cat_feat.items()})
+            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+            test_probs.append(probs)
+            test_true.append(labels[out_nodes].detach().cpu().numpy())
 
-    mask = y_test != 2
-    test_score = test_score[mask]
-    y_test = y_test[mask]
-    test_pred = test_pred[mask]
+    test_probs = np.concatenate(test_probs) if test_probs else np.array([])
+    test_true = np.concatenate(test_true) if test_true else np.array([])
 
-    test_auc = roc_auc_score(y_test, test_score)
-    test_f1 = f1_score(y_test, test_pred, average="macro")
-    test_ap = average_precision_score(y_test, test_score)
+    if len(test_probs) > 0 and len(np.unique(test_true)) > 1:
+        test_auc = roc_auc_score(test_true, test_probs)
+        test_ap = average_precision_score(test_true, test_probs)
+    else:
+        test_auc = 0.0
+        test_ap = 0.0
 
-    print("test AUC:", test_auc)
-    print("test f1:", test_f1)
-    print("test AP:", test_ap)
+    test_pred = (test_probs >= 0.5).astype(int) if len(test_probs) > 0 else np.array([])
+    test_f1 = f1_score(test_true, test_pred) if len(test_pred) > 0 and len(np.unique(test_true)) > 1 else 0.0
 
+    # log final metrics
     if experiment is not None:
         try:
             experiment.log_metric("test_auc", float(test_auc))
@@ -346,6 +262,8 @@ def gtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, e
             experiment.log_metric("test_ap", float(test_ap))
         except Exception:
             pass
+
+    return float(test_auc), float(test_f1), float(test_ap)
 
 
 # -------------------------
@@ -359,120 +277,64 @@ def _find_ieee_files(prefix_dir: str):
         (os.path.join(prefix_dir, "ieee-fraud-detection", "train_transaction.csv"),
          os.path.join(prefix_dir, "ieee-fraud-detection", "train_identity.csv")),
     ]
-    for tx_path, id_path in candidates:
-        if os.path.exists(tx_path):
-            return tx_path, (id_path if os.path.exists(id_path) else None)
+    for tx, ident in candidates:
+        if os.path.exists(tx):
+            return tx, ident if os.path.exists(ident) else None
     return None, None
 
 
-def _read_ieee_from_zip(zip_path: str):
-    import zipfile
-    with zipfile.ZipFile(zip_path, "r") as z:
-        names = z.namelist()
-        tx_name = None
-        id_name = None
-        for n in names:
-            if n.endswith("train_transaction.csv"):
-                tx_name = n
-            elif n.endswith("train_identity.csv"):
-                id_name = n
+def _load_ieee_raw_df(train_tx_path: str, train_id_path: str = None):
+    df_tx = pd.read_csv(train_tx_path, low_memory=False)
 
-        if tx_name is None:
-            raise FileNotFoundError("train_transaction.csv not found inside zip")
+    if train_id_path and os.path.exists(train_id_path):
+        df_id = pd.read_csv(train_id_path, low_memory=False)
+        df = df_tx.merge(df_id, on="TransactionID", how="left")
+    else:
+        df = df_tx
 
-        with z.open(tx_name) as f:
-            tx = pd.read_csv(f)
-
-        identity = None
-        if id_name is not None:
-            with z.open(id_name) as f:
-                identity = pd.read_csv(f)
-
-    return tx, identity
-
-
-def _build_ieee_raw_graph(df: pd.DataFrame,
-                          time_col: str = "TransactionDT",
-                          edge_per_trans: int = 3,
-                          max_group_size: int = 5000):
-    if time_col not in df.columns:
-        raise ValueError(f"IEEE dataframe missing required time column: {time_col}")
-
-    entity_cols = [
-        "card1", "card2", "card3", "card4", "card5", "card6",
-        "addr1", "addr2",
-        "P_emaildomain", "R_emaildomain",
-        "DeviceType", "DeviceInfo",
-    ]
-    entity_cols = [c for c in entity_cols if c in df.columns]
-
-    alls, allt = [], []
-    df = df.reset_index(drop=True)
-
-    for col in entity_cols:
-        src, tgt = [], []
-        for _, gdf in df.groupby(col, dropna=True):
-            if len(gdf) < 2:
-                continue
-            if len(gdf) > max_group_size:
-                gdf = gdf.sample(n=max_group_size, random_state=42)
-            gdf = gdf.sort_values(by=time_col)
-            sorted_idxs = gdf.index.to_list()
-            n = len(sorted_idxs)
-            for i in range(n):
-                for j in range(1, edge_per_trans + 1):
-                    if i + j < n:
-                        src.append(sorted_idxs[i])
-                        tgt.append(sorted_idxs[i + j])
-        if src:
-            alls.extend(src)
-            allt.extend(tgt)
-
-    if len(alls) == 0:
-        gdf = df.sort_values(by=time_col)
-        idxs = gdf.index.to_list()
-        for i in range(len(idxs) - 1):
-            alls.append(idxs[i])
-            allt.append(idxs[i + 1])
-
-    g = dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(df))
-    return g
+    return df
 
 
 # -------------------------
 # IEEE NORM helpers
 # -------------------------
 def _find_ieee_norm_train(prefix_dir: str):
-    """
-    Expect normalized IEEE (S-FFSD-like) here:
-      data/ieee_sffsd_like/ieee_sffsd_like_train.csv
-
-    Also accepts any *train*.csv inside that folder.
-    """
-    import glob
-
-    norm_dir = os.path.join(prefix_dir, "ieee_sffsd_like")
-    canonical = os.path.join(norm_dir, "ieee_sffsd_like_train.csv")
-    if os.path.exists(canonical):
-        return canonical
-
-    cands = sorted(glob.glob(os.path.join(norm_dir, "*train*.csv")))
-    return cands[0] if cands else None
+    candidates = [
+        os.path.join(prefix_dir, "ieee_sffsd_like", "ieee_sffsd_like_train.csv"),
+        os.path.join(prefix_dir, "ieee_sffsd_like_train.csv"),
+        os.path.join(prefix_dir, "IEEE_sffsd_like", "ieee_sffsd_like_train.csv"),
+        os.path.join(prefix_dir, "ieee_sffsd_like", "train.csv"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _looks_like_ieee_norm(df: pd.DataFrame) -> bool:
+    cols = set(df.columns)
     required = {"Time", "Source", "Target", "Amount", "Location", "Type", "Labels"}
-    return required.issubset(set(df.columns))
+    return required.issubset(cols)
 
 
-def _load_ieee_norm_df(norm_path: str) -> pd.DataFrame:
-    df = pd.read_csv(norm_path)
-    df = df.loc[:, ~df.columns.str.contains('Unnamed')]
-    if not _looks_like_ieee_norm(df):
-        raise ValueError(
-            f"Normalized IEEE file does not have required columns. Found: {list(df.columns)}"
-        )
+def _load_ieee_norm_df(norm_path: str):
+    df = pd.read_csv(norm_path, low_memory=False)
+    # enforce expected columns if present
+    if "Amount" in df.columns and "TransactionAmt" in df.columns:
+        df = df.rename(columns={"TransactionAmt": "Amount"})
     return df
+
+
+def _ensure_self_loops(g: dgl.DGLGraph) -> dgl.DGLGraph:
+    try:
+        g = dgl.remove_self_loop(g)
+    except Exception:
+        pass
+    try:
+        g = dgl.add_self_loop(g)
+    except Exception:
+        pass
+    return g
 
 
 def _build_ieee_norm_graph(data: pd.DataFrame, edge_per_trans: int = 3) -> dgl.DGLGraph:
@@ -498,6 +360,7 @@ def _build_ieee_norm_graph(data: pd.DataFrame, edge_per_trans: int = 3) -> dgl.D
             allt.extend(tgt)
 
     if len(alls) == 0:
+        # fallback chain by time
         gdf = data.sort_values(by="Time")
         idxs = gdf.index.to_list()
         for i in range(len(idxs) - 1):
@@ -523,7 +386,7 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
         alls, allt = [], []
         pair = ["Source", "Target", "Location", "Type"]
-        edge_per_trans = 3
+
         for column in pair:
             src, tgt = [], []
             for _, c_df in data.groupby(column):
@@ -531,12 +394,13 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
                 sorted_idxs = c_df.index.to_list()
                 df_len = len(sorted_idxs)
                 for i in range(df_len):
-                    for j in range(1, edge_per_trans + 1):
+                    for j in range(1, 4):
                         if i + j < df_len:
                             src.append(sorted_idxs[i])
                             tgt.append(sorted_idxs[i + j])
-            alls.extend(src)
-            allt.extend(tgt)
+            if src:
+                alls.extend(src)
+                allt.extend(tgt)
 
         g = dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(data))
         g = _ensure_self_loops(g)
@@ -563,8 +427,92 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
         )
 
     elif str(dataset).lower() in ("ieee", "ieee-cis", "ieeecis"):
+        # IEEE supports multiple modes:
+        #   - raw  : load original train_transaction.csv (and optional identity) and build a raw graph
+        #   - norm : load pre-normalized S-FFSD-like CSV and build a norm graph
+        #   - v2   : load v2 prebuilt features + prebuilt graph (entity-gated graph builder)
+        #
+        # v2 is intended to be generated by data-scripts/prep_ieee_v2.py and will not rebuild here.
+        if str(ieee_mode).lower() == "v2":
+            v2_dir = os.path.join(prefix, "ieee_v2")
+            feat_path = os.path.join(v2_dir, "ieee_v2_train.csv")
+            graph_path = os.path.join(v2_dir, "graph-IEEE-v2.bin")
+
+            print(f"[IEEE V2] feature_csv={feat_path} exists={os.path.exists(feat_path)}", flush=True)
+            print(f"[IEEE V2] graph_bin={graph_path} exists={os.path.exists(graph_path)}", flush=True)
+
+            if not os.path.exists(feat_path):
+                raise FileNotFoundError(
+                    f"IEEE v2 features not found: {feat_path}. "
+                    f"Run: python3 prep_ieee_v2.py --tx-csv <train_transaction.csv> --id-csv <train_identity.csv> "
+                    f"--out-dir {v2_dir} --save-dgl-bin"
+                )
+            if not os.path.exists(graph_path):
+                raise FileNotFoundError(
+                    f"IEEE v2 graph bin not found: {graph_path}. "
+                    f"Re-run prep_ieee_v2.py with --save-dgl-bin to generate graph-IEEE-v2.bin"
+                )
+
+            # Load v2 feature table (already engineered + numeric) and labels
+            v2_df = pd.read_csv(feat_path, low_memory=False)
+            if "Labels" not in v2_df.columns:
+                raise ValueError(f"IEEE v2 features CSV must contain a 'Labels' column: {feat_path}")
+
+            # Keep same label semantics as other loaders
+            v2_df = v2_df[v2_df["Labels"] <= 2].reset_index(drop=True)
+
+            labels = v2_df["Labels"].astype(int)
+
+            # Build feature matrix: drop identifiers; keep numeric columns only
+            drop_cols = {"Labels", "TransactionID", "node_id"}
+            feat_cols = [c for c in v2_df.columns if c not in drop_cols]
+            feat_data = v2_df[feat_cols]
+
+            # Coerce any non-numeric to numeric (should be rare for v2)
+            obj_cols = [c for c in feat_data.columns if feat_data[c].dtype == "object"]
+            for col in obj_cols:
+                feat_data[col] = feat_data[col].astype(str).fillna("NA")
+                feat_data[col] = feat_data[col].astype("category").cat.codes
+
+            feat_data = feat_data.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+            # Load cached v2 graph (prebuilt by v2 builder)
+            t0 = time.time()
+            graphs, _ = dgl.data.utils.load_graphs(graph_path)
+            g = graphs[0]
+            g = _ensure_self_loops(g)
+            dt = time.time() - t0
+
+            print(f"[IEEE V2] Loaded cached graph in {dt:.2f}s", flush=True)
+            try:
+                print(f"[IEEE V2] graph stats: nodes={g.number_of_nodes():,} edges={g.number_of_edges():,}", flush=True)
+            except Exception:
+                pass
+
+            # Validate node alignment (v2 graphs are transaction-node graphs; nodes must match rows)
+            if g.number_of_nodes() != len(labels):
+                raise ValueError(
+                    f"IEEE v2 graph/node mismatch: graph_nodes={g.number_of_nodes():,} "
+                    f"df_rows={len(labels):,}. "
+                    f"This usually means the v2 graph was built from a different CSV version. "
+                    f"Re-run prep_ieee_v2.py to regenerate both ieee_v2_train.csv and graph-IEEE-v2.bin together."
+                )
+
+            # Push features/labels into graph
+            g.ndata["label"] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+            g.ndata["feat"] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
+
+            # Indices split
+            index = list(range(len(labels)))
+            train_idx, test_idx, _, _ = train_test_split(
+                index, labels, stratify=labels, test_size=test_size / 2,
+                random_state=2, shuffle=True
+            )
+
+            cat_features = []
+            return feat_data, labels, train_idx, test_idx, g, cat_features
+
         # Decide raw vs norm
-        ieee_mode = (ieee_mode or "auto").lower()
         norm_path = _find_ieee_norm_train(prefix)
         can_use_norm = False
         if norm_path and os.path.exists(norm_path):
@@ -584,71 +532,47 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             df = _load_ieee_norm_df(norm_path)
             data = df[df["Labels"] <= 2].reset_index(drop=True)
 
-            # -----------------------------
-            # GRAPH CACHE LOAD/BUILD LOGIC
-            # -----------------------------
-            graph_path = os.path.join(prefix, "graph-IEEE-norm.bin")
-            force_rebuild = os.environ.get("IEEE_FORCE_REBUILD_GRAPH", "0") == "1"
-            force_prebuilt = os.environ.get("IEEE_FORCE_PREBUILT_GRAPH", "0") == "1"
-
-            _log_graph_file(graph_path, "norm-cache")
+            # graph cache handling (norm)
+            cache_path = os.path.join(prefix, "graph-IEEE-norm.bin")
+            try:
+                exists = os.path.exists(cache_path)
+                size = os.path.getsize(cache_path) if exists else 0
+                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(cache_path))) if exists else "NA"
+                print(f"[IEEE GRAPH] norm-cache path={cache_path} exists={exists} size_bytes={size} mtime={mtime}", flush=True)
+            except Exception:
+                pass
 
             g = None
-            loaded = False
-
-            if force_prebuilt and not os.path.exists(graph_path):
-                raise FileNotFoundError(
-                    f"IEEE_FORCE_PREBUILT_GRAPH=1 but graph not found at: {graph_path}"
-                )
-
-            if (not force_rebuild) and os.path.exists(graph_path):
+            if os.path.exists(cache_path):
                 try:
+                    print("[IEEE GRAPH] Loading cached graph-IEEE-norm.bin ...", flush=True)
                     t0 = time.time()
-                    print("[IEEE GRAPH] Loading cached graph-IEEE-norm.bin ...")
-                    gs, _ = dgl.load_graphs(graph_path)
-                    g = gs[0]
-                    loaded = True
-                    print(f"[IEEE GRAPH] Loaded cached graph in {time.time() - t0:.2f}s")
-                    _log_graph_stats(g, "loaded-norm")
+                    graphs, _ = dgl.data.utils.load_graphs(cache_path)
+                    g = graphs[0]
+                    print(f"[IEEE GRAPH] Loaded cached graph in {time.time()-t0:.2f}s", flush=True)
+                    print(f"[IEEE GRAPH] loaded-norm stats: nodes={g.number_of_nodes():,} edges={g.number_of_edges():,}", flush=True)
 
-                    # Validate node count matches current normalized dataframe
-                    if int(g.num_nodes()) != int(len(data)):
-                        print(
-                            f"[IEEE GRAPH] WARNING node count mismatch: graph_nodes={int(g.num_nodes()):,} "
-                            f"df_rows={int(len(data)):,} -> will rebuild"
-                        )
-                        loaded = False
+                    # if cached graph nodes don't match, rebuild
+                    if g.number_of_nodes() != len(data):
+                        print(f"[IEEE GRAPH] WARNING node count mismatch: graph_nodes={g.number_of_nodes():,} df_rows={len(data):,} -> will rebuild", flush=True)
                         g = None
-                        if force_prebuilt:
-                            raise ValueError(
-                                f"IEEE_FORCE_PREBUILT_GRAPH=1 but cached graph node count "
-                                f"({int(gs[0].num_nodes())}) != normalized rows ({len(data)})"
-                            )
                 except Exception as e:
-                    print(f"[IEEE GRAPH] Failed to load cached graph ({e}) -> will rebuild")
-                    loaded = False
+                    print(f"[IEEE GRAPH] WARNING failed to load cached norm graph ({e}); will rebuild", flush=True)
                     g = None
-                    if force_prebuilt:
-                        raise
 
-            if (g is None) or force_rebuild or (not loaded):
-                print("[IEEE GRAPH] Building graph (norm) ...")
-                t1 = time.time()
-                # NOTE: edge_per_trans fixed at 3 in this implementation; if you want it configurable,
-                # wire args['ieee_next_k'] through args and pass here.
+            if g is None:
+                print("[IEEE GRAPH] Building graph (norm) ...", flush=True)
+                t0 = time.time()
                 g = _build_ieee_norm_graph(data, edge_per_trans=3)
                 g = _ensure_self_loops(g)
-                print(f"[IEEE GRAPH] Built graph in {time.time() - t1:.2f}s")
-                _log_graph_stats(g, "built-norm")
-
+                print(f"[IEEE GRAPH] Built graph in {time.time()-t0:.2f}s", flush=True)
+                print(f"[IEEE GRAPH] built-norm stats: nodes={g.number_of_nodes():,} edges={g.number_of_edges():,}", flush=True)
                 try:
-                    dgl.data.utils.save_graphs(graph_path, [g])
-                    print(f"[IEEE GRAPH] Saved graph to {graph_path}")
-                    _log_graph_file(graph_path, "norm-cache-after-save")
-                except Exception as e:
-                    print(f"[IEEE GRAPH] WARNING failed to save graph cache ({e})")
+                    dgl.data.utils.save_graphs(cache_path, [g])
+                    print(f"[IEEE GRAPH] Saved graph to {cache_path}", flush=True)
+                except Exception:
+                    pass
 
-            # Encode categoricals to numeric
             for col in ["Source", "Target", "Location", "Type"]:
                 le = LabelEncoder()
                 data[col] = le.fit_transform(data[col].apply(str).values)
@@ -656,7 +580,7 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             feat_data = data.drop("Labels", axis=1)
             labels = data["Labels"]
 
-            # Encode any remaining object/string columns for IEEE norm
+            # encode any remaining object columns (defensive)
             obj_cols = [c for c in feat_data.columns if feat_data[c].dtype == "object"]
             for col in obj_cols:
                 feat_data[col] = feat_data[col].astype(str).fillna("NA")
@@ -670,147 +594,117 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
             g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
+            try:
+                dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE-norm.bin"), [g])
+            except Exception:
+                pass
+
             train_idx, test_idx, _, _ = train_test_split(
-                index, labels, stratify=labels, test_size=test_size,
+                index, labels, stratify=labels, test_size=test_size / 2,
                 random_state=2, shuffle=True
             )
 
         else:
-            # --- Raw IEEE (train_transaction.csv) ---
-            use_identity = False
+            # --- Raw IEEE ---
             cat_features = []
 
-            zip_path = os.path.join(prefix, "ieee-fraud-detection.zip")
-            tx_path, id_path = _find_ieee_files(prefix)
-
-            if os.path.exists(zip_path):
-                tx, identity = _read_ieee_from_zip(zip_path)
-            elif tx_path is not None:
-                tx = pd.read_csv(tx_path)
-                identity = pd.read_csv(id_path) if (use_identity and id_path is not None) else None
-            else:
+            train_tx_path, train_id_path = _find_ieee_files(prefix)
+            if train_tx_path is None:
                 raise FileNotFoundError(
-                    "IEEE dataset not found. Place either:\n"
-                    f"  - {zip_path}\n"
-                    "  - data/train_transaction.csv\n"
-                    "  - data/IEEE/train_transaction.csv\n"
-                    "  - data/ieee/train_transaction.csv\n"
-                    "  - data/ieee-fraud-detection/train_transaction.csv\n"
+                    f"Could not find IEEE train_transaction.csv under {prefix}. "
+                    f"Expected at {prefix}/train_transaction.csv or similar."
                 )
 
-            if use_identity and identity is not None and "TransactionID" in tx.columns and "TransactionID" in identity.columns:
-                df = tx.merge(identity, on="TransactionID", how="left")
-            else:
-                df = tx.copy()
-
+            df = _load_ieee_raw_df(train_tx_path, train_id_path)
+            # labels column in raw IEEE
             if "isFraud" not in df.columns:
-                raise ValueError("IEEE train_transaction.csv must include 'isFraud' column")
+                raise ValueError("Raw IEEE must contain 'isFraud' column.")
 
-            labels = df["isFraud"].astype(int)
+            # build a simple raw graph:
+            # connect transactions that share same card1 or addr1 if present (fallback)
+            data = df.copy()
+            data["Labels"] = data["isFraud"].fillna(0).astype(int)
+            data = data[data["Labels"] <= 2].reset_index(drop=True)
 
-            drop_cols = [c for c in ["TransactionID", "isFraud"] if c in df.columns]
-            feat_df = df.drop(columns=drop_cols)
+            # Graph cache for raw
+            cache_path = os.path.join(prefix, "graph-IEEE-raw.bin")
+            g = None
+            if os.path.exists(cache_path):
+                try:
+                    print(f"[IEEE GRAPH] raw-cache path={cache_path} exists=True size_bytes={os.path.getsize(cache_path)}", flush=True)
+                    print("[IEEE GRAPH] Loading cached graph-IEEE-raw.bin ...", flush=True)
+                    t0 = time.time()
+                    graphs, _ = dgl.data.utils.load_graphs(cache_path)
+                    g = graphs[0]
+                    print(f"[IEEE GRAPH] Loaded cached graph in {time.time()-t0:.2f}s", flush=True)
+                    print(f"[IEEE GRAPH] loaded-raw stats: nodes={g.number_of_nodes():,} edges={g.number_of_edges():,}", flush=True)
+                    if g.number_of_nodes() != len(data):
+                        print(f"[IEEE GRAPH] WARNING node count mismatch: graph_nodes={g.number_of_nodes():,} df_rows={len(data):,} -> will rebuild", flush=True)
+                        g = None
+                except Exception as e:
+                    print(f"[IEEE GRAPH] WARNING failed to load cached raw graph ({e}); will rebuild", flush=True)
+                    g = None
 
-            g = _build_ieee_raw_graph(feat_df, time_col="TransactionDT", edge_per_trans=3, max_group_size=5000)
-            g = _ensure_self_loops(g)
+            if g is None:
+                # Basic connectivity: by card1 then addr1 else time chain
+                alls, allt = [], []
+                key_cols = []
+                if "card1" in data.columns:
+                    key_cols.append("card1")
+                if "addr1" in data.columns:
+                    key_cols.append("addr1")
 
-            obj_cols = [c for c in feat_df.columns if feat_df[c].dtype == "object"]
-            for col in obj_cols:
-                le = LabelEncoder()
-                feat_df[col] = le.fit_transform(feat_df[col].astype(str).fillna("NA").values)
-                cat_features.append(col)
-
-            for col in feat_df.columns:
-                if col in cat_features:
-                    feat_df[col] = feat_df[col].fillna(0).astype(int)
+                if key_cols:
+                    for col in key_cols:
+                        for _, c_df in data.groupby(col):
+                            # skip NaNs
+                            if pd.isna(_) or _ == "":
+                                continue
+                            c_df = c_df.sort_values(by="TransactionDT" if "TransactionDT" in c_df.columns else c_df.index)
+                            idxs = c_df.index.to_list()
+                            for i in range(len(idxs) - 1):
+                                alls.append(idxs[i])
+                                allt.append(idxs[i + 1])
                 else:
-                    if pd.api.types.is_numeric_dtype(feat_df[col]):
-                        med = feat_df[col].median()
-                        if pd.isna(med):
-                            med = 0.0
-                        feat_df[col] = feat_df[col].fillna(med)
-                    else:
-                        feat_df[col] = feat_df[col].fillna(0)
+                    # chain by transaction time
+                    sort_col = "TransactionDT" if "TransactionDT" in data.columns else None
+                    gdf = data.sort_values(by=sort_col) if sort_col else data
+                    idxs = gdf.index.to_list()
+                    for i in range(len(idxs) - 1):
+                        alls.append(idxs[i])
+                        allt.append(idxs[i + 1])
 
-            g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
-            g.ndata['feat'] = torch.from_numpy(feat_df.to_numpy()).to(torch.float32)
+                g = dgl.graph((np.array(alls), np.array(allt)), num_nodes=len(data))
+                g = _ensure_self_loops(g)
 
-            try:
-                dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE-raw.bin"), [g])
-            except Exception:
-                pass
+                try:
+                    dgl.data.utils.save_graphs(cache_path, [g])
+                except Exception:
+                    pass
+
+            # Build raw features: drop Labels/isFraud/TransactionID; coerce numeric
+            labels = data["Labels"]
+            drop_cols = ["Labels", "isFraud"]
+            if "TransactionID" in data.columns:
+                drop_cols.append("TransactionID")
+            feat_data = data.drop(columns=[c for c in drop_cols if c in data.columns], axis=1)
+
+            # encode object cols
+            obj_cols = [c for c in feat_data.columns if feat_data[c].dtype == "object"]
+            for col in obj_cols:
+                feat_data[col] = feat_data[col].astype(str).fillna("NA")
+                feat_data[col] = feat_data[col].astype("category").cat.codes
+
+            feat_data = feat_data.apply(pd.to_numeric, errors="coerce").fillna(0)
 
             index = list(range(len(labels)))
+            g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+            g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
+
             train_idx, test_idx, _, _ = train_test_split(
-                index, labels, stratify=labels, test_size=test_size,
+                index, labels, stratify=labels, test_size=test_size / 2,
                 random_state=2, shuffle=True
             )
-
-            feat_data = feat_df
-
-    elif dataset == "yelp":
-        cat_features = []
-        data_file = loadmat(prefix + 'YelpChi.mat')
-        labels = pd.DataFrame(data_file['label'].flatten())[0]
-        feat_data = pd.DataFrame(data_file['features'].todense().A)
-
-        with open(prefix + 'yelp_homo_adjlists.pickle', 'rb') as file:
-            homo = pickle.load(file)
-
-        index = list(range(len(labels)))
-        train_idx, test_idx, _, _ = train_test_split(
-            index, labels, stratify=labels, test_size=test_size,
-            random_state=2, shuffle=True
-        )
-
-        src, tgt = [], []
-        for i in homo:
-            for j in homo[i]:
-                src.append(i)
-                tgt.append(j)
-
-        g = dgl.graph((np.array(src), np.array(tgt)), num_nodes=len(labels))
-        g = _ensure_self_loops(g)
-
-        g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
-        g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
-
-        try:
-            dgl.data.utils.save_graphs(prefix + f"graph-{dataset}.bin", [g])
-        except Exception:
-            pass
-
-    elif dataset == "amazon":
-        cat_features = []
-        data_file = loadmat(prefix + 'Amazon.mat')
-        labels = pd.DataFrame(data_file['label'].flatten())[0]
-        feat_data = pd.DataFrame(data_file['features'].todense().A)
-
-        with open(prefix + 'amz_homo_adjlists.pickle', 'rb') as file:
-            homo = pickle.load(file)
-
-        index = list(range(3305, len(labels)))
-        train_idx, test_idx, _, _ = train_test_split(
-            index, labels[3305:], stratify=labels[3305:],
-            test_size=test_size, random_state=2, shuffle=True
-        )
-
-        src, tgt = [], []
-        for i in homo:
-            for j in homo[i]:
-                src.append(i)
-                tgt.append(j)
-
-        g = dgl.graph((np.array(src), np.array(tgt)), num_nodes=len(labels))
-        g = _ensure_self_loops(g)
-
-        g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
-        g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
-
-        try:
-            dgl.data.utils.save_graphs(prefix + f"graph-{dataset}.bin", [g])
-        except Exception:
-            pass
 
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
