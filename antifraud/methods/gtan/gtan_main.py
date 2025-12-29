@@ -2,6 +2,7 @@ import numpy as np
 import dgl
 import torch
 import os
+import time
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 import torch.optim as optim
 from scipy.io import loadmat
@@ -39,6 +40,31 @@ def _ensure_self_loops(g: dgl.DGLGraph) -> dgl.DGLGraph:
     except Exception:
         pass
     return g
+
+
+def _log_graph_file(graph_path: str, tag: str):
+    exists = os.path.exists(graph_path)
+    size = os.path.getsize(graph_path) if exists else 0
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(graph_path))) if exists else "N/A"
+    print(f"[IEEE GRAPH] {tag} path={graph_path} exists={exists} size_bytes={size} mtime={mtime}")
+
+
+def _log_graph_stats(g: dgl.DGLGraph, tag: str):
+    try:
+        n_nodes = int(g.num_nodes())
+        n_edges = int(g.num_edges())
+        print(f"[IEEE GRAPH] {tag} stats: nodes={n_nodes:,} edges={n_edges:,}")
+        if hasattr(g, "ndata") and "label" in g.ndata:
+            y = g.ndata["label"]
+            try:
+                y_np = y.detach().cpu().numpy()
+                pos = int((y_np == 1).sum())
+                tot = int(y_np.shape[0])
+                print(f"[IEEE GRAPH] {tag} labels: pos={pos:,} rate={pos / max(tot, 1):.6f}")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[IEEE GRAPH] {tag} stats: unable to compute ({e})")
 
 
 def gtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, experiment: Experiment = None):
@@ -472,7 +498,6 @@ def _build_ieee_norm_graph(data: pd.DataFrame, edge_per_trans: int = 3) -> dgl.D
             allt.extend(tgt)
 
     if len(alls) == 0:
-        # fallback chain by time
         gdf = data.sort_values(by="Time")
         idxs = gdf.index.to_list()
         for i in range(len(idxs) - 1):
@@ -559,9 +584,71 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             df = _load_ieee_norm_df(norm_path)
             data = df[df["Labels"] <= 2].reset_index(drop=True)
 
-            g = _build_ieee_norm_graph(data, edge_per_trans=3)
-            g = _ensure_self_loops(g)
+            # -----------------------------
+            # GRAPH CACHE LOAD/BUILD LOGIC
+            # -----------------------------
+            graph_path = os.path.join(prefix, "graph-IEEE-norm.bin")
+            force_rebuild = os.environ.get("IEEE_FORCE_REBUILD_GRAPH", "0") == "1"
+            force_prebuilt = os.environ.get("IEEE_FORCE_PREBUILT_GRAPH", "0") == "1"
 
+            _log_graph_file(graph_path, "norm-cache")
+
+            g = None
+            loaded = False
+
+            if force_prebuilt and not os.path.exists(graph_path):
+                raise FileNotFoundError(
+                    f"IEEE_FORCE_PREBUILT_GRAPH=1 but graph not found at: {graph_path}"
+                )
+
+            if (not force_rebuild) and os.path.exists(graph_path):
+                try:
+                    t0 = time.time()
+                    print("[IEEE GRAPH] Loading cached graph-IEEE-norm.bin ...")
+                    gs, _ = dgl.load_graphs(graph_path)
+                    g = gs[0]
+                    loaded = True
+                    print(f"[IEEE GRAPH] Loaded cached graph in {time.time() - t0:.2f}s")
+                    _log_graph_stats(g, "loaded-norm")
+
+                    # Validate node count matches current normalized dataframe
+                    if int(g.num_nodes()) != int(len(data)):
+                        print(
+                            f"[IEEE GRAPH] WARNING node count mismatch: graph_nodes={int(g.num_nodes()):,} "
+                            f"df_rows={int(len(data)):,} -> will rebuild"
+                        )
+                        loaded = False
+                        g = None
+                        if force_prebuilt:
+                            raise ValueError(
+                                f"IEEE_FORCE_PREBUILT_GRAPH=1 but cached graph node count "
+                                f"({int(gs[0].num_nodes())}) != normalized rows ({len(data)})"
+                            )
+                except Exception as e:
+                    print(f"[IEEE GRAPH] Failed to load cached graph ({e}) -> will rebuild")
+                    loaded = False
+                    g = None
+                    if force_prebuilt:
+                        raise
+
+            if (g is None) or force_rebuild or (not loaded):
+                print("[IEEE GRAPH] Building graph (norm) ...")
+                t1 = time.time()
+                # NOTE: edge_per_trans fixed at 3 in this implementation; if you want it configurable,
+                # wire args['ieee_next_k'] through args and pass here.
+                g = _build_ieee_norm_graph(data, edge_per_trans=3)
+                g = _ensure_self_loops(g)
+                print(f"[IEEE GRAPH] Built graph in {time.time() - t1:.2f}s")
+                _log_graph_stats(g, "built-norm")
+
+                try:
+                    dgl.data.utils.save_graphs(graph_path, [g])
+                    print(f"[IEEE GRAPH] Saved graph to {graph_path}")
+                    _log_graph_file(graph_path, "norm-cache-after-save")
+                except Exception as e:
+                    print(f"[IEEE GRAPH] WARNING failed to save graph cache ({e})")
+
+            # Encode categoricals to numeric
             for col in ["Source", "Target", "Location", "Type"]:
                 le = LabelEncoder()
                 data[col] = le.fit_transform(data[col].apply(str).values)
@@ -569,7 +656,7 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             feat_data = data.drop("Labels", axis=1)
             labels = data["Labels"]
 
-            # --- FIX: encode any remaining object/string columns for IEEE norm so Torch can convert ---
+            # Encode any remaining object/string columns for IEEE norm
             obj_cols = [c for c in feat_data.columns if feat_data[c].dtype == "object"]
             for col in obj_cols:
                 feat_data[col] = feat_data[col].astype(str).fillna("NA")
@@ -583,11 +670,6 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             g.ndata['label'] = torch.from_numpy(labels.to_numpy()).to(torch.long)
             g.ndata['feat'] = torch.from_numpy(feat_data.to_numpy()).to(torch.float32)
 
-            try:
-                dgl.data.utils.save_graphs(os.path.join(prefix, "graph-IEEE-norm.bin"), [g])
-            except Exception:
-                pass
-
             train_idx, test_idx, _, _ = train_test_split(
                 index, labels, stratify=labels, test_size=test_size,
                 random_state=2, shuffle=True
@@ -595,7 +677,6 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
         else:
             # --- Raw IEEE (train_transaction.csv) ---
-            # Transaction-only by default (identity ignored)
             use_identity = False
             cat_features = []
 
@@ -627,7 +708,6 @@ def load_gtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
             labels = df["isFraud"].astype(int)
 
-            # prevent label leakage
             drop_cols = [c for c in ["TransactionID", "isFraud"] if c in df.columns]
             feat_df = df.drop(columns=drop_cols)
 
