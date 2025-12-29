@@ -9,6 +9,7 @@ import dgl
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F  # <-- needed for activation default
 
 from scipy.io import loadmat
 from sklearn.model_selection import StratifiedKFold, train_test_split
@@ -59,50 +60,52 @@ def _safe_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _normalize_dropout(drop):
+    """
+    Your GraphAttnModel implementation expects `drop` to be indexable (drop[0], drop[1]).
+    This normalizes whatever comes in via args['dropout'] into a 2-item list.
+
+    - None -> [0.2, 0.1]
+    - float/int -> [x, x]
+    - [x] -> [x, x]
+    - [x, y, ...] -> [x, y]
+    """
+    if drop is None:
+        return [0.2, 0.1]
+    if isinstance(drop, (int, float)):
+        x = float(drop)
+        return [x, x]
+    if isinstance(drop, (list, tuple)):
+        if len(drop) == 0:
+            return [0.2, 0.1]
+        if len(drop) == 1:
+            x = float(drop[0])
+            return [x, x]
+        return [float(drop[0]), float(drop[1])]
+    # unexpected type -> safe default
+    return [0.2, 0.1]
+
+
+def _default_activation():
+    # Safe default for many GTAN-style models
+    return F.elu
+
+
 def _build_graphattn_model(input_dim: int, args: dict) -> nn.Module:
     """
     Construct GraphAttnModel using only kwargs that its __init__ supports.
     Fixes mismatches like: in_dim vs in_feats vs input_dim, etc.
+
+    ALSO:
+      - ensures dropout is always a 2-item list (since your model uses drop[0])
+      - ensures activation is always passed (your model requires it)
     """
     sig = inspect.signature(GraphAttnModel.__init__)
     supported = set(sig.parameters.keys())
 
-    desired = {
-        # input feature dimension
-        "in_dim": input_dim,
-        "in_feats": input_dim,
-        "in_feat": input_dim,
-        "in_features": input_dim,
-        "input_dim": input_dim,
-        "nfeat": input_dim,
-        "num_feat": input_dim,
-
-        # hidden dimension
-        "hidden_dim": args.get("hid_dim"),
-        "hid_dim": args.get("hid_dim"),
-        "nhid": args.get("hid_dim"),
-        "hidden": args.get("hid_dim"),
-
-        # output classes
-        "out_dim": 2,
-        "nclass": 2,
-        "num_class": 2,
-        "num_classes": 2,
-
-        # depth
-        "n_layers": args.get("n_layers"),
-        "num_layers": args.get("n_layers"),
-        "layers": args.get("n_layers"),
-
-        # heads
-        "n_heads": 1,
-        "num_heads": 1,
-        "heads": 1,
-
-        # dropout
-        "dropout": args.get("dropout"),
-        "drop": args.get("dropout"),
-    }
+    # normalize dropout + activation
+    drop = _normalize_dropout(args.get("dropout"))
+    activation = args.get("activation") or _default_activation()
 
     # If model supports **kwargs, we can pass "canonical" keys it recognizes
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
@@ -122,15 +125,60 @@ def _build_graphattn_model(input_dim: int, args: dict) -> nn.Module:
             k_l = _first_supported(["n_layers", "num_layers", "layers"])
             k_hd = _first_supported(["n_heads", "num_heads", "heads"])
             k_dr = _first_supported(["dropout", "drop"])
+            k_ac = _first_supported(["activation", "act", "nonlinearity"])
 
             if k_in: canon[k_in] = input_dim
             if k_h:  canon[k_h] = args.get("hid_dim")
             if k_o:  canon[k_o] = 2
             if k_l:  canon[k_l] = args.get("n_layers")
             if k_hd: canon[k_hd] = 1
-            if k_dr: canon[k_dr] = args.get("dropout")
+            if k_dr: canon[k_dr] = drop
+            if k_ac: canon[k_ac] = activation
 
             return GraphAttnModel(**canon)
+
+        # no **kwargs: try passing only supported kwargs
+        desired = {
+            # input feature dimension
+            "in_dim": input_dim,
+            "in_feats": input_dim,
+            "in_feat": input_dim,
+            "in_features": input_dim,
+            "input_dim": input_dim,
+            "nfeat": input_dim,
+            "num_feat": input_dim,
+
+            # hidden dimension
+            "hidden_dim": args.get("hid_dim"),
+            "hid_dim": args.get("hid_dim"),
+            "nhid": args.get("hid_dim"),
+            "hidden": args.get("hid_dim"),
+
+            # output classes
+            "out_dim": 2,
+            "nclass": 2,
+            "num_class": 2,
+            "num_classes": 2,
+
+            # depth
+            "n_layers": args.get("n_layers"),
+            "num_layers": args.get("n_layers"),
+            "layers": args.get("n_layers"),
+
+            # heads
+            "n_heads": 1,
+            "num_heads": 1,
+            "heads": 1,
+
+            # dropout
+            "dropout": drop,
+            "drop": drop,
+
+            # activation
+            "activation": activation,
+            "act": activation,
+            "nonlinearity": activation,
+        }
 
         kwargs = {k: v for k, v in desired.items() if (k in supported and v is not None)}
         if kwargs:
@@ -140,10 +188,17 @@ def _build_graphattn_model(input_dim: int, args: dict) -> nn.Module:
         pass
 
     # Fallback positional (common patterns across forks)
+    # Your repo requires activation; and expects drop to be list-like.
     try:
-        return GraphAttnModel(input_dim, args.get("hid_dim"), 2, args.get("n_layers"), 1, args.get("dropout"))
+        # common: (in_dim, hid_dim, out_dim, n_layers, n_heads, drop, activation)
+        return GraphAttnModel(input_dim, args.get("hid_dim"), 2, args.get("n_layers"), 1, drop, activation)
     except TypeError:
-        return GraphAttnModel(input_dim, args.get("hid_dim"), 2, args.get("n_layers"), args.get("dropout"))
+        try:
+            # common: (in_dim, hid_dim, out_dim, n_layers, drop, activation)
+            return GraphAttnModel(input_dim, args.get("hid_dim"), 2, args.get("n_layers"), drop, activation)
+        except TypeError:
+            # last resort: try without heads
+            return GraphAttnModel(input_dim, args.get("hid_dim"), 2, args.get("n_layers"), drop)
 
 
 # -------------------------
