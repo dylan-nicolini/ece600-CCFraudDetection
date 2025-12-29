@@ -1,75 +1,57 @@
 import os
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-import logging
+import yaml
+import time
+import random
 import numpy as np
 import pandas as pd
+
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from sklearn.model_selection import train_test_split
-import yaml
+from sklearn.preprocessing import LabelEncoder
 
-from config import Config
-from feature_engineering.data_engineering import (
-    data_engineer_benchmark,
-    span_data_2d,
-    span_data_3d,
-)
-
-logger = logging.getLogger(__name__)
-
-# --- Optional Comet support ---
-try:
-    from comet_ml import Experiment
-except Exception:
-    Experiment = None
+from comet_ml import Experiment
 
 
 def init_comet(args: dict):
     """
-    Create ONE Comet experiment per run.
+    Initializes Comet ML experiment if api_key is present in YAML config.
     """
-    if Experiment is None:
-        return None
+    comet_cfg = args.get("comet", {}) if isinstance(args.get("comet", {}), dict) else {}
+    api_key = comet_cfg.get("api_key") or os.environ.get("COMET_API_KEY")
 
-    api_key = os.getenv("COMET_API_KEY")
     if not api_key:
         return None
 
-    exp = Experiment(
+    experiment = Experiment(
         api_key=api_key,
-        workspace=os.getenv("COMET_WORKSPACE"),
-        project_name=os.getenv("COMET_PROJECT_NAME", "ccfraud-gnn"),
-        auto_param_logging=False,
+        project_name=comet_cfg.get("project_name", "antifraud"),
+        workspace=comet_cfg.get("workspace", None),
         auto_metric_logging=False,
-        auto_output_logging="simple",
-        disabled=(os.getenv("COMET_API_KEY") is None),
+        auto_param_logging=False,
+        auto_output_logging=False,
     )
 
-    try:
-        exp.set_name(f"{args.get('method')}-{args.get('dataset')}-seed{args.get('seed')}")
-        exp.add_tag(str(args.get("method")))
-        exp.add_tag(str(args.get("dataset")))
-        exp.log_parameters(args)
-    except Exception:
-        pass
-
-    return exp
+    experiment.log_parameters({k: v for k, v in args.items() if k != "comet"})
+    return experiment
 
 
 def log_comet_status(experiment):
-    print("----- COMET STATUS -----")
-    api_key = os.getenv("COMET_API_KEY")
-    print("COMET_API_KEY set:", "YES" if api_key else "NO")
-    if api_key:
-        print("COMET_API_KEY preview:", api_key[:6] + "..." + api_key[-4:])
-    print("COMET_WORKSPACE:", os.getenv("COMET_WORKSPACE"))
-    print("COMET_PROJECT_NAME:", os.getenv("COMET_PROJECT_NAME"))
-
     if experiment is None:
-        print("Experiment object: None (Comet disabled)")
+        print("[COMET] Not enabled (no API key).", flush=True)
     else:
-        print("Experiment object created:", True)
-        print("Experiment disabled:", experiment.disabled)
+        print("[COMET] Enabled.", flush=True)
 
-    print("------------------------")
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
 
 def parse_args():
@@ -107,8 +89,6 @@ def parse_args():
         yaml_file = "config/stan_cfg.yaml"
     elif method == "stan_2d":
         yaml_file = "config/stan_2d_cfg.yaml"
-    elif method == "stagn":
-        yaml_file = "config/stagn_cfg.yaml"
     elif method == "gtan":
         yaml_file = "config/gtan_cfg.yaml"
     elif method == "rgtan":
@@ -131,6 +111,20 @@ def parse_args():
     return args
 
 
+def span_data_3d(feat_df):
+    """
+    Placeholder for stan path; not modified here.
+    """
+    raise NotImplementedError
+
+
+def span_data_2d(feat_df):
+    """
+    Placeholder for stan_2d path; not modified here.
+    """
+    raise NotImplementedError
+
+
 def base_load_data(args: dict):
     data_path = "data/S-FFSD.csv"
     feat_df = pd.read_csv(data_path)
@@ -141,13 +135,17 @@ def base_load_data(args: dict):
     else:
         features, labels = span_data_2d(feat_df)
 
-    trf, tef, trl, tel = train_test_split(
-        features,
-        labels,
+    train_idx, test_idx = train_test_split(
+        np.arange(len(labels)),
         train_size=train_size,
         stratify=labels,
-        shuffle=True,
+        random_state=args["seed"],
     )
+
+    trf = features[train_idx]
+    tef = features[test_idx]
+    trl = labels[train_idx]
+    tel = labels[test_idx]
 
     np.save(args["trainfeature"], trf)
     np.save(args["testfeature"], tef)
@@ -166,11 +164,27 @@ def main(args):
         if args["method"] == "gtan":
             from methods.gtan.gtan_main import gtan_main, load_gtan_data
 
-            feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
-                dataset=args["dataset"],
-                test_size=args["test_size"],
-                ieee_mode=args["ieee_mode"],
-            )
+            # Support both signatures:
+            #   load_gtan_data(dataset=..., ...)
+            # and
+            #   load_gtan_data(prefix=..., dataset=..., ...)
+            import inspect
+
+            sig = inspect.signature(load_gtan_data)
+            if "prefix" in sig.parameters:
+                prefix = args.get("prefix") or args.get("data_dir") or args.get("data_path") or "data"
+                feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
+                    prefix=prefix,
+                    dataset=args["dataset"],
+                    test_size=args["test_size"],
+                    ieee_mode=args["ieee_mode"],
+                )
+            else:
+                feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
+                    dataset=args["dataset"],
+                    test_size=args["test_size"],
+                    ieee_mode=args["ieee_mode"],
+                )
 
             gtan_main(
                 feat_data,
@@ -183,13 +197,12 @@ def main(args):
                 experiment=experiment,
             )
 
-        elif args["method"] == "rgtan":
+        if args["method"] == "rgtan":
             from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
 
-            feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
+            feat_data, labels, train_idx, test_idx, g, cat_features = loda_rgtan_data(
                 dataset=args["dataset"],
                 test_size=args["test_size"],
-                ieee_mode=args["ieee_mode"],
             )
 
             rgtan_main(
@@ -200,27 +213,15 @@ def main(args):
                 labels,
                 args,
                 cat_features,
-                neigh_features,
                 experiment=experiment,
             )
 
-        elif args["method"] == "hogrl":
-            from methods.hogrl.hogrl_main import hogrl_main
-            hogrl_main(args)
-
-        if experiment:
-            experiment.log_other("status", "success")
-
-    except Exception as e:
-        if experiment:
-            experiment.log_other("status", "failed")
-            experiment.log_other("exception", repr(e))
-        raise
-
     finally:
-        if experiment:
-            print("Ending Comet experiment...")
-            experiment.end()
+        if experiment is not None:
+            try:
+                experiment.end()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
