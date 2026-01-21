@@ -200,10 +200,12 @@ def main(args):
         if args["method"] == "rgtan":
             from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
 
-            feat_data, labels, train_idx, test_idx, g, cat_features = loda_rgtan_data(
+            feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
                 dataset=args["dataset"],
                 test_size=args["test_size"],
             )
+
+            nei_att_head = args.get("nei_att_head", 4)  # default if not in YAML
 
             rgtan_main(
                 feat_data,
@@ -213,6 +215,8 @@ def main(args):
                 labels,
                 args,
                 cat_features,
+                neigh_features,
+                nei_att_head,
                 experiment=experiment,
             )
 
