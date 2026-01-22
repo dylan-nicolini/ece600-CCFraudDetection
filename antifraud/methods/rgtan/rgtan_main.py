@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 import dgl
 
+
+
 from tqdm import tqdm
 from scipy.io import loadmat
 
@@ -20,6 +22,12 @@ try:
     from dgl.dataloading import NodeDataLoader
 except ImportError:
     from dgl.dataloading import DataLoader as NodeDataLoader
+
+try:
+    from dgl.dataloading import MultiLayerFullNeighborSampler
+except Exception:
+    from dgl.dataloading import MultiLayerNeighborSampler as MultiLayerFullNeighborSampler
+
 
 from torch.optim.lr_scheduler import MultiStepLR
 
