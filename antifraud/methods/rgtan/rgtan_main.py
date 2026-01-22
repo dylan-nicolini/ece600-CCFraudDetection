@@ -572,16 +572,20 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
     raise ValueError(f"Unknown dataset: {dataset}")
 
-def rgtan_main(args: dict):
+def rgtan_main(args: dict, **kwargs):
     """
-    Wrapper required by antifraud/main.py:
-      from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
+    Entry point expected by antifraud/main.py.
 
-    This loads the dataset, then runs training/eval.
+    main.py calls:
+        rgtan_main(args, experiment=experiment)
+
+    So we must accept **kwargs and forward experiment explicitly.
     """
     dataset = args.get("dataset", "IEEE")
     test_size = float(args.get("test_size", 0.4))
     ieee_mode = args.get("ieee_mode", "auto")
+
+    experiment = kwargs.get("experiment", None)
 
     # Load data
     feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
@@ -590,10 +594,10 @@ def rgtan_main(args: dict):
         ieee_mode=ieee_mode
     )
 
-    # Optional neigh padding dict (your code expects it even if empty)
+    # Required placeholder (used even if empty)
     neigh_padding_dict = {}
 
-    # Run training/eval
+    # Run training + evaluation
     return run_rgtan(
         feat_df=feat_data,
         labels=labels,
@@ -604,5 +608,5 @@ def rgtan_main(args: dict):
         cat_features=cat_features,
         nei_feat=neigh_features,
         neigh_padding_dict=neigh_padding_dict,
-        experiment=args.get("experiment", None),
+        experiment=experiment,
     )
