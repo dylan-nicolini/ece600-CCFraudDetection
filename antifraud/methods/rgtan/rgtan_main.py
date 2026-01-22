@@ -572,32 +572,30 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
     raise ValueError(f"Unknown dataset: {dataset}")
 
-def rgtan_main(args: dict, **kwargs):
+def rgtan_main(
+    feat_data,
+    g,
+    train_idx,
+    test_idx,
+    labels,
+    args,
+    cat_features,
+    neigh_features,
+    nei_att_head,
+    experiment=None,
+):
     """
-    Entry point expected by antifraud/main.py.
+    Signature matches antifraud/main.py exactly.
 
-    main.py calls:
-        rgtan_main(args, experiment=experiment)
-
-    So we must accept **kwargs and forward experiment explicitly.
+    main.py passes:
+      (feat_data, g, train_idx, test_idx, labels, args, cat_features, neigh_features, nei_att_head, experiment=?)
     """
-    dataset = args.get("dataset", "IEEE")
-    test_size = float(args.get("test_size", 0.4))
-    ieee_mode = args.get("ieee_mode", "auto")
+    # Ensure the attention head count makes it into the model build inside run_rgtan()
+    if isinstance(args, dict):
+        args["nei_att_head"] = nei_att_head
 
-    experiment = kwargs.get("experiment", None)
-
-    # Load data
-    feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
-        dataset=dataset,
-        test_size=test_size,
-        ieee_mode=ieee_mode
-    )
-
-    # Required placeholder (used even if empty)
     neigh_padding_dict = {}
 
-    # Run training + evaluation
     return run_rgtan(
         feat_df=feat_data,
         labels=labels,
