@@ -571,3 +571,38 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
         return feat_data, pd.Series(labels), train_idx, test_idx, g, cat_features, neigh_features
 
     raise ValueError(f"Unknown dataset: {dataset}")
+
+def rgtan_main(args: dict):
+    """
+    Wrapper required by antifraud/main.py:
+      from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
+
+    This loads the dataset, then runs training/eval.
+    """
+    dataset = args.get("dataset", "IEEE")
+    test_size = float(args.get("test_size", 0.4))
+    ieee_mode = args.get("ieee_mode", "auto")
+
+    # Load data
+    feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
+        dataset=dataset,
+        test_size=test_size,
+        ieee_mode=ieee_mode
+    )
+
+    # Optional neigh padding dict (your code expects it even if empty)
+    neigh_padding_dict = {}
+
+    # Run training/eval
+    return run_rgtan(
+        feat_df=feat_data,
+        labels=labels,
+        train_idx=train_idx,
+        test_idx=test_idx,
+        graph=g,
+        args=args,
+        cat_features=cat_features,
+        nei_feat=neigh_features,
+        neigh_padding_dict=neigh_padding_dict,
+        experiment=args.get("experiment", None),
+    )
