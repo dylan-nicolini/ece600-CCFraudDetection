@@ -9,8 +9,6 @@ import torch.nn as nn
 import torch.optim as optim
 import dgl
 
-
-
 from tqdm import tqdm
 from scipy.io import loadmat
 
@@ -26,6 +24,7 @@ except ImportError:
 try:
     from dgl.dataloading import MultiLayerFullNeighborSampler
 except Exception:
+    # Older DGL versions may not have MultiLayerFullNeighborSampler; use NeighborSampler as a fallback
     from dgl.dataloading import MultiLayerNeighborSampler as MultiLayerFullNeighborSampler
 
 
@@ -226,6 +225,41 @@ def run_rgtan(
             num_workers=0,
         )
 
+        # ---- Harden args defaults (avoid KeyError when CLI does not supply optional params)
+        if isinstance(args.get('dropout', None), (float, int)):
+            args['dropout'] = [float(args['dropout']), float(args['dropout'])]
+        if args.get('dropout', None) is None:
+            args['dropout'] = [0.2, 0.1]
+        if isinstance(args['dropout'], (list, tuple)) and len(args['dropout']) == 1:
+            args['dropout'] = [float(args['dropout'][0]), float(args['dropout'][0])]
+        args.setdefault('hid_dim', 128)
+        args.setdefault('n_layers', 2)
+        args.setdefault('gated', True)
+        args.setdefault('lr', 0.003)
+        args.setdefault('wd', 1e-4)
+        args.setdefault('batch_size', 1024)
+        args.setdefault('max_epochs', 10)
+        args.setdefault('early_stopping', 10)
+        args.setdefault('seed', 2023)
+        args.setdefault('n_fold', 5)
+        # Activation: keep existing if it is an nn.Module; otherwise default to ELU
+        if 'activation' not in args or args['activation'] is None or not isinstance(args['activation'], nn.Module):
+            args['activation'] = nn.ELU()
+        # Heads: allow int or list; ensure list length == n_layers
+        if 'heads' not in args or args['heads'] is None:
+            args['heads'] = [1] * int(args['n_layers'])
+        else:
+            h = args['heads']
+            if isinstance(h, int):
+                args['heads'] = [h] * int(args['n_layers'])
+            elif isinstance(h, (list, tuple)):
+                h = list(h)
+                if len(h) < int(args['n_layers']):
+                    h = h + [h[-1]] * (int(args['n_layers']) - len(h))
+                args['heads'] = h[: int(args['n_layers'])]
+            else:
+                args['heads'] = [1] * int(args['n_layers'])
+
         # Initialize model
         # nei_att_head can be passed by args; fallback to 1
         nei_att_head = args.get("nei_att_head", 1)
@@ -235,7 +269,7 @@ def run_rgtan(
             hidden_dim=args["hid_dim"],
             n_layers=args["n_layers"],
             n_classes=2,
-            heads=args["heads"],
+            heads=args.get("heads"),
             activation=args["activation"],
             drop=args["dropout"],
             device=device,
@@ -296,8 +330,6 @@ def run_rgtan(
             model.eval()
             val_loss_sum = 0.0
             val_count = 0
-            val_logits_collector = []  # just for batch prints
-            val_labels_collector = []
 
             with torch.no_grad():
                 for step, (input_nodes, seeds, blocks) in enumerate(val_dataloader):
@@ -565,7 +597,6 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
         )
 
         # build graph
-        # if you have a converted S-FFSD-shaped IEEE file, pass it here via your own pipeline
         g = gen_graph(feat_data.rename(columns={"TransactionDT": "Time"}), edge_per_trans=3)
 
         # pick a reasonable default of categorical columns if present
@@ -580,6 +611,7 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
     raise ValueError(f"Unknown dataset: {dataset}")
 
+
 def rgtan_main(
     feat_data,
     g,
@@ -593,12 +625,16 @@ def rgtan_main(
     experiment=None,
 ):
     """
-    Signature matches antifraud/main.py exactly.
+    Entry point expected by antifraud/main.py.
 
-    main.py passes:
-      (feat_data, g, train_idx, test_idx, labels, args, cat_features, neigh_features, nei_att_head, experiment=?)
+    main.py calls:
+        rgtan_main(feat_data, g, train_idx, test_idx, labels, args, cat_features, neigh_features, nei_att_head, experiment=...)
+
+    This function forwards into run_rgtan(), which implements:
+      - OOF logits recomputed using the best checkpoint per fold
+      - Test logits averaged across folds
     """
-    # Ensure the attention head count makes it into the model build inside run_rgtan()
+    # Ensure nei_att_head is available to model builder inside run_rgtan()
     if isinstance(args, dict):
         args["nei_att_head"] = nei_att_head
 
