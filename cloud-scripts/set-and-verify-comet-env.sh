@@ -23,4 +23,3 @@ echo "NOTE:"
 echo "• These vars are session-only."
 echo "• To make them permanent, see instructions below."
 
- python main.py --method rgtan --dataset IEEE

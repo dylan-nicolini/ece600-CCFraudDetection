@@ -7,46 +7,50 @@ import pandas as pd
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
-from comet_ml import Experiment
+# --- Comet ML (optional) ---
+try:
+    from comet_ml import Experiment  # type: ignore
+except Exception:
+    Experiment = None
 
 
 def init_comet(args: dict):
     """
-    Initializes Comet ML experiment if api_key is present in YAML config.
+    Initialize Comet experiment if comet config is present and comet_ml is installed.
+    Expects args to be a dict (loaded from YAML).
     """
     comet_cfg = args.get("comet", {}) if isinstance(args.get("comet", {}), dict) else {}
-    api_key = comet_cfg.get("api_key") or os.environ.get("COMET_API_KEY")
-
-    if not api_key:
+    if not comet_cfg or Experiment is None:
         return None
 
-    experiment = Experiment(
+    api_key = comet_cfg.get("api_key") or os.environ.get("COMET_API_KEY")
+    project_name = comet_cfg.get("project_name") or os.environ.get("COMET_PROJECT_NAME")
+    workspace = comet_cfg.get("workspace") or os.environ.get("COMET_WORKSPACE")
+
+    if not api_key or not project_name:
+        return None
+
+    exp = Experiment(
         api_key=api_key,
-        project_name=comet_cfg.get("project_name", "ece600-ccfraud"),
-        workspace=comet_cfg.get("workspace", None),
-        auto_metric_logging=False,
+        project_name=project_name,
+        workspace=workspace,
         auto_param_logging=False,
-        auto_output_logging=False,
+        auto_metric_logging=False,
+        auto_output_logging="simple",
     )
 
+    # Log the args (minus nested comet dict)
+    experiment = exp
     experiment.log_parameters({k: v for k, v in args.items() if k != "comet"})
     return experiment
 
 
-def log_comet_status(experiment):
-    if experiment is None:
-        print("[COMET] Not enabled (no API key).", flush=True)
-    else:
-        print("[COMET] Enabled.", flush=True)
-
-
-def set_seed(seed: int):
+def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     try:
-        import torch
+        import torch  # type: ignore
 
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -55,199 +59,106 @@ def set_seed(seed: int):
 
 
 def parse_args():
-    """
-    Loads the method's YAML config, then applies optional CLI overrides:
-      python main.py --method gtan --dataset IEEE --ieee-mode v2
-    """
     parser = ArgumentParser(
+        description="ECE600 Credit Card Fraud Detection (GTAN / RGTAN runner)",
         formatter_class=ArgumentDefaultsHelpFormatter,
-        conflict_handler="resolve",
     )
-
-    parser.add_argument("--method", required=True)
-    parser.add_argument("--dataset", default=None)
-
-    parser.add_argument(
-        "--ieee-mode",
-        default="auto",
-        choices=["auto", "raw", "norm", "v2"],
-        help=(
-            "IEEE loader mode:\n"
-            "  raw  = original train_transaction.csv\n"
-            "  norm = S-FFSD-like normalized file\n"
-            "  v2   = entity-gated v2 graph\n"
-            "  auto = prefer norm if present, else raw"
-        ),
-    )
-
-    args_cli = vars(parser.parse_args())
-    method = args_cli["method"]
-
-    if method == "mcnn":
-        yaml_file = "config/mcnn_cfg.yaml"
-    elif method == "stan":
-        yaml_file = "config/stan_cfg.yaml"
-    elif method == "stan_2d":
-        yaml_file = "config/stan_2d_cfg.yaml"
-    elif method == "gtan":
-        yaml_file = "config/gtan_cfg.yaml"
-    elif method == "rgtan":
-        yaml_file = "config/rgtan_cfg.yaml"
-    elif method == "hogrl":
-        yaml_file = "config/hogrl_cfg.yaml"
-    else:
-        raise NotImplementedError(f"Unsupported method: {method}")
-
-    with open(yaml_file, "r") as f:
-        args = yaml.safe_load(f)
-
-    args["method"] = method
-
-    if args_cli.get("dataset"):
-        args["dataset"] = args_cli["dataset"]
-
-    args["ieee_mode"] = args_cli.get("ieee_mode", "auto")
-
-    return args
+    parser.add_argument("--method", type=str, required=True, help="gtan or rgtan")
+    parser.add_argument("--dataset", type=str, required=False, default=None, help="sffsd or ieee")
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
+    return vars(parser.parse_args())
 
 
-def span_data_3d(feat_df):
+def load_yaml_config(path: str) -> dict:
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def merge_args_config(cli_args: dict, cfg: dict) -> dict:
     """
-    Placeholder for stan path; not modified here.
+    CLI args take precedence where provided; config provides defaults.
     """
-    raise NotImplementedError
+    merged = dict(cfg)
+    for k, v in cli_args.items():
+        if v is not None:
+            merged[k] = v
+    return merged
 
 
-def span_data_2d(feat_df):
-    """
-    Placeholder for stan_2d path; not modified here.
-    """
-    raise NotImplementedError
+def main(cli_args: dict):
+    cfg = load_yaml_config(cli_args["config"])
+    args = merge_args_config(cli_args, cfg)
 
+    # Seed
+    seed = int(args.get("seed", 42))
+    seed_everything(seed)
 
-def base_load_data(args: dict):
-    data_path = "data/S-FFSD.csv"
-    feat_df = pd.read_csv(data_path)
-    train_size = 1 - args["test_size"]
-
-    if args["method"] == "stan":
-        features, labels = span_data_3d(feat_df)
-    else:
-        features, labels = span_data_2d(feat_df)
-
-    train_idx, test_idx = train_test_split(
-        np.arange(len(labels)),
-        train_size=train_size,
-        stratify=labels,
-        random_state=args["seed"],
-    )
-
-    trf = features[train_idx]
-    tef = features[test_idx]
-    trl = labels[train_idx]
-    tel = labels[test_idx]
-
-    np.save(args["trainfeature"], trf)
-    np.save(args["testfeature"], tef)
-    np.save(args["trainlabel"], trl)
-    np.save(args["testlabel"], tel)
-
-
-def main(args):
+    # Optional Comet
     experiment = init_comet(args)
-    log_comet_status(experiment)
 
-    try:
-        if args["method"] in {"mcnn", "stan", "stan_2d"}:
-            base_load_data(args)
+    method = (args.get("method") or "").lower()
+    dataset = (args.get("dataset") or "").lower() if args.get("dataset") else None
 
-        if args["method"] == "gtan":
-            from methods.gtan.gtan_main import gtan_main, load_gtan_data
+    # Import methods lazily to avoid heavy imports when not needed
+    if method == "gtan":
+        from methods.gtan.gtan_main import load_gtan_data, train_gtan  # type: ignore
 
-            # Support both signatures:
-            #   load_gtan_data(dataset=..., ...)
-            # and
-            #   load_gtan_data(prefix=..., dataset=..., ...)
-            import inspect
+        # Dataset routing
+        if dataset == "sffsd":
+            # Example: expects args to specify data path and columns consistent with S-FFSD
+            # Use your existing load function logic (gtan_main.py) as source of truth.
+            print("[INFO] Loading S-FFSD dataset for GTAN...")
+            feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(args)
+            print("[INFO] Training GTAN...")
+            print(f"[RUN] method={args['method']} dataset={args.get('dataset')}")
+            train_gtan(args, feat_data, labels, train_idx, test_idx, g, cat_features, experiment)
 
-            print("=" * 80)
-            print(f"[RUN] method={args.method} dataset={args.dataset}")
+        elif dataset == "ieee":
+            print("[INFO] Loading IEEE dataset for GTAN...")
+            feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(args)
+            print("[INFO] Training GTAN...")
+            print(f"[RUN] method={args['method']} dataset={args.get('dataset')}")
+            train_gtan(args, feat_data, labels, train_idx, test_idx, g, cat_features, experiment)
 
-            sig = inspect.signature(load_gtan_data)
-            if "prefix" in sig.parameters:
-                prefix = args.get("prefix") or args.get("data_dir") or args.get("data_path") or "data"
-                feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
-                    prefix=prefix,
-                    dataset=args["dataset"],
-                    test_size=args["test_size"],
-                    ieee_mode=args["ieee_mode"],
-                )
-            else:
-                feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
-                    dataset=args["dataset"],
-                    test_size=args["test_size"],
-                    ieee_mode=args["ieee_mode"],
-                )
+        else:
+            # If dataset not specified, attempt default path in args
+            print("[WARN] No dataset specified; proceeding with load_gtan_data(args) using config paths.")
+            feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(args)
+            print("[INFO] Training GTAN...")
+            train_gtan(args, feat_data, labels, train_idx, test_idx, g, cat_features, experiment)
 
-                print(f"[DATA LOADED]")
-                print(f"  features shape : {feat_data.shape}")
-                print(f"  labels shape   : {labels.shape}")
-                print(f"  train samples  : {len(train_idx)}")
-                print(f"  test samples   : {len(test_idx)}")
-                print(f"  categorical    : {cat_features}")
-                print("=" * 80)
+    elif method == "rgtan":
+        from methods.rgtan.rgtan_main import load_rgtan_data, train_rgtan  # type: ignore
 
-            gtan_main(
-                feat_data,
-                g,
-                train_idx,
-                test_idx,
-                labels,
-                args,
-                cat_features,
-                experiment=experiment,
-            )
+        if dataset == "sffsd":
+            print("[INFO] Loading S-FFSD dataset for RGTAN...")
+            feat_data, labels, train_idx, test_idx, g, cat_features = load_rgtan_data(args)
+            print("[INFO] Training RGTAN...")
+            print(f"[RUN] method={args['method']} dataset={args.get('dataset')}")
+            train_rgtan(args, feat_data, labels, train_idx, test_idx, g, cat_features, experiment)
 
-        if args["method"] == "rgtan":
-            from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
+        elif dataset == "ieee":
+            print("[INFO] Loading IEEE dataset for RGTAN...")
+            feat_data, labels, train_idx, test_idx, g, cat_features = load_rgtan_data(args)
+            print("[INFO] Training RGTAN...")
+            print(f"[RUN] method={args['method']} dataset={args.get('dataset')}")
+            train_rgtan(args, feat_data, labels, train_idx, test_idx, g, cat_features, experiment)
 
-            print("=" * 80)
-            print(f"[RUN] method={args.method} dataset={args.dataset}")
+        else:
+            print("[WARN] No dataset specified; proceeding with load_rgtan_data(args) using config paths.")
+            feat_data, labels, train_idx, test_idx, g, cat_features = load_rgtan_data(args)
+            print("[INFO] Training RGTAN...")
+            train_rgtan(args, feat_data, labels, train_idx, test_idx, g, cat_features, experiment)
 
-            feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
-                dataset=args["dataset"],
-                test_size=args["test_size"],
-            )
+    else:
+        raise ValueError(f"Unknown method: {method}. Expected 'gtan' or 'rgtan'.")
 
-            print(f"[DATA LOADED]")
-            print(f"  features shape : {feat_data.shape}")
-            print(f"  labels shape   : {labels.shape}")
-            print(f"  train samples  : {len(train_idx)}")
-            print(f"  test samples   : {len(test_idx)}")
-            print(f"  categorical    : {cat_features}")
-            print("=" * 80)
-            
-            nei_att_head = args.get("nei_att_head", 4)  # default if not in YAML
-
-            rgtan_main(
-                feat_data,
-                g,
-                train_idx,
-                test_idx,
-                labels,
-                args,
-                cat_features,
-                neigh_features,
-                nei_att_head,
-                experiment=experiment,
-            )
-
-    finally:
-        if experiment is not None:
-            try:
-                experiment.end()
-            except Exception:
-                pass
+    if experiment is not None:
+        try:
+            experiment.end()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
