@@ -542,7 +542,9 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
     # --- IEEE
     if dataset == "IEEE":
-
+        
+        data_path = "./data/ieee_modified/ieee_sffsd_with_reuse.csv"
+        print(f"[DATA FILE] {data_path}")
         # Load pre-processed IEEE already mapped to S-FFSD + reuse features
         data = pd.read_csv(
             "./data/ieee_modified/ieee_sffsd_with_reuse.csv"

@@ -170,6 +170,9 @@ def main(args):
             #   load_gtan_data(prefix=..., dataset=..., ...)
             import inspect
 
+            print("=" * 80)
+            print(f"[RUN] method={args.method} dataset={args.dataset}")
+
             sig = inspect.signature(load_gtan_data)
             if "prefix" in sig.parameters:
                 prefix = args.get("prefix") or args.get("data_dir") or args.get("data_path") or "data"
@@ -186,6 +189,14 @@ def main(args):
                     ieee_mode=args["ieee_mode"],
                 )
 
+                print(f"[DATA LOADED]")
+                print(f"  features shape : {feat_data.shape}")
+                print(f"  labels shape   : {labels.shape}")
+                print(f"  train samples  : {len(train_idx)}")
+                print(f"  test samples   : {len(test_idx)}")
+                print(f"  categorical    : {cat_features}")
+                print("=" * 80)
+
             gtan_main(
                 feat_data,
                 g,
@@ -200,11 +211,22 @@ def main(args):
         if args["method"] == "rgtan":
             from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
 
+            print("=" * 80)
+            print(f"[RUN] method={args.method} dataset={args.dataset}")
+
             feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
                 dataset=args["dataset"],
                 test_size=args["test_size"],
             )
 
+            print(f"[DATA LOADED]")
+            print(f"  features shape : {feat_data.shape}")
+            print(f"  labels shape   : {labels.shape}")
+            print(f"  train samples  : {len(train_idx)}")
+            print(f"  test samples   : {len(test_idx)}")
+            print(f"  categorical    : {cat_features}")
+            print("=" * 80)
+            
             nei_att_head = args.get("nei_att_head", 4)  # default if not in YAML
 
             rgtan_main(
