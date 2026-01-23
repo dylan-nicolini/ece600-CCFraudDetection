@@ -24,7 +24,7 @@ def init_comet(args: dict):
 
     experiment = Experiment(
         api_key=api_key,
-        project_name=comet_cfg.get("project_name", "antifraud"),
+        project_name=comet_cfg.get("project_name", "ece600-ccfraud"),
         workspace=comet_cfg.get("workspace", None),
         auto_metric_logging=False,
         auto_param_logging=False,
