@@ -542,53 +542,19 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
 
     # --- IEEE
     if dataset == "IEEE":
-        # locate files
-        base_dir = "./data/ieee"
-        zip_path = os.path.join(base_dir, "ieee-fraud-detection.zip")
-        tx_name = "train_transaction.csv"
-        id_name = "train_identity.csv"
 
-        if os.path.exists(zip_path):
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                names = set(zf.namelist())
-                tx_file = next((n for n in names if n.endswith(tx_name)), None)
-                id_file = next((n for n in names if n.endswith(id_name)), None)
-                if tx_file is None:
-                    raise FileNotFoundError("train_transaction.csv not found inside zip")
+        # Load pre-processed IEEE already mapped to S-FFSD + reuse features
+        data = pd.read_csv(
+            "./data/ieee_modified/ieee_sffsd_with_reuse.csv"
+        )
 
-                with zf.open(tx_file) as f:
-                    train_transaction = pd.read_csv(f)
-                if id_file is not None:
-                    with zf.open(id_file) as f:
-                        train_identity = pd.read_csv(f)
-                else:
-                    train_identity = None
-        else:
-            tx_path = os.path.join(base_dir, tx_name)
-            id_path = os.path.join(base_dir, id_name)
-            train_transaction = pd.read_csv(tx_path)
-            train_identity = pd.read_csv(id_path) if os.path.exists(id_path) else None
+        # Labels
+        labels = data["Labels"].astype(int)
 
-        # merge identity if present
-        if train_identity is not None and "TransactionID" in train_transaction.columns and "TransactionID" in train_identity.columns:
-            data = train_transaction.merge(train_identity, on="TransactionID", how="left")
-        else:
-            data = train_transaction.copy()
+        # Features (everything except label)
+        feat_data = data.drop(columns=["Labels"])
 
-        labels = data["isFraud"].fillna(0).astype(int)
-        feat_data = data.drop(columns=["isFraud"], errors="ignore")
-
-        # encode object columns
-        obj_cols = feat_data.select_dtypes(include=["object"]).columns.tolist()
-        le = LabelEncoder()
-        for c in obj_cols:
-            feat_data[c] = feat_data[c].fillna("missing").astype(str)
-            feat_data[c] = le.fit_transform(feat_data[c])
-
-        # fill numeric nans
-        feat_data = feat_data.fillna(0)
-
-        # train/test split
+        # Train / test split (stratified)
         train_idx, test_idx = train_test_split(
             np.arange(len(feat_data)),
             test_size=test_size,
@@ -596,18 +562,25 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
             stratify=labels.values,
         )
 
-        # build graph
-        g = gen_graph(feat_data.rename(columns={"TransactionDT": "Time"}), edge_per_trans=3)
+        # Build reuse-aware graph
+        # gen_graph already connects within Source / Target / Location by Time
+        g = gen_graph(feat_data, edge_per_trans=3)
 
-        # pick a reasonable default of categorical columns if present
-        cat_features = []
-        for c in ["Target", "Location", "Type"]:
-            if c in feat_data.columns:
-                cat_features.append(c)
+        # Categorical features for embeddings (CRITICAL for RGTAN)
+        cat_features = ["Source", "Target", "Location", "Type"]
 
         neigh_features = {}
 
-        return feat_data, pd.Series(labels), train_idx, test_idx, g, cat_features, neigh_features
+        return (
+            feat_data,
+            labels,
+            train_idx,
+            test_idx,
+            g,
+            cat_features,
+            neigh_features,
+        )
+
 
     raise ValueError(f"Unknown dataset: {dataset}")
 
