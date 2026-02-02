@@ -98,6 +98,18 @@ def try_create_comet_experiment(enabled: bool, project: str, workspace: str, tag
     except Exception as e:
         return None, f"failed to create comet experiment: {e}"
 
+class InNeighborSampler(MultiLayerNeighborSampler):
+    """
+    Forces in-neighbor sampling for each layer.
+
+    This is critical when your graph is directed (entity -> transaction) and
+    you seed 'transaction' nodes. If the sampler uses out-neighbors, you'll
+    get empty blocks and no 'transaction' outputs.
+    """
+    def sample_frontier(self, block_id, g, seed_nodes):
+        fanout = self.fanouts[block_id]
+        # Sample IN-neighbors explicitly
+        return dgl.sampling.sample_neighbors(g, seed_nodes, fanout, edge_dir="in")
 
 # -----------------------------
 # Helpers: incremental mapping
@@ -535,7 +547,7 @@ def make_dataloaders(g_cpu, train_mask, val_mask, fanouts, batch_size, num_worke
     train_nids = {"transaction": torch.nonzero(train_mask, as_tuple=False).squeeze(1)}
     val_nids = {"transaction": torch.nonzero(val_mask, as_tuple=False).squeeze(1)}
 
-    sampler = MultiLayerNeighborSampler(fanouts)
+    sampler = InNeighborSampler(fanouts)
 
     train_loader = DataLoader(
         g_cpu,
