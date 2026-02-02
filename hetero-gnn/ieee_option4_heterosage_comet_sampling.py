@@ -158,6 +158,124 @@ def zread_csv(zf: zipfile.ZipFile, name: str, usecols=None, chunksize=None):
 # -----------------------------
 class HeteroSAGEBlockClassifier(nn.Module):
     """
+    Manual hetero message passing over blocks (compatible with older DGL).
+
+    We avoid dgl.nn.HeteroGraphConv because older versions require special keys
+    and can silently skip relations, resulting in missing 'transaction' output.
+
+    For each layer:
+      For each canonical etype (src, rel, dst) in the sampled block:
+        out[dst] += SAGEConv(block[etype], (h_src, h_dst))
+      h := relu(dropout(out))
+    """
+    def __init__(self, full_g: dgl.DGLHeteroGraph, tx_in_dim: int, hidden_dim=64, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = nn.Dropout(dropout)
+
+        self.ntypes = full_g.ntypes
+        self.canonical_etypes = full_g.canonical_etypes  # list of (src, rel, dst)
+
+        # Transaction feature projection
+        self.tx_proj = nn.Linear(tx_in_dim, hidden_dim)
+
+        # Entity embeddings (ID-only baseline)
+        self.emb = nn.ModuleDict()
+        for ntype in self.ntypes:
+            if ntype == "transaction":
+                continue
+            self.emb[ntype] = nn.Embedding(full_g.num_nodes(ntype), hidden_dim)
+
+        # Per-layer, per-relation conv modules, keyed by a SAFE string
+        # Key format: "src__rel__dst" (all strings, avoids ModuleDict tuple errors)
+        self.rel_convs = nn.ModuleList()
+        for _ in range(num_layers):
+            md = nn.ModuleDict()
+            for (s, r, d) in self.canonical_etypes:
+                key = f"{s}__{r}__{d}"
+                md[key] = dgl.nn.SAGEConv(
+                    in_feats=hidden_dim,
+                    out_feats=hidden_dim,
+                    aggregator_type="mean"
+                )
+            self.rel_convs.append(md)
+
+        self.cls = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def _input_features_for_block(self, block: dgl.DGLHeteroGraph, full_g: dgl.DGLHeteroGraph) -> dict:
+        """
+        Build input features for SRC nodes of the first block.
+        block.srcnodes[ntype].data[dgl.NID] gives original IDs in full graph.
+        """
+        h = {}
+        device = block.device
+
+        for ntype in block.srctypes:
+            src_nids = block.srcnodes[ntype].data[dgl.NID]
+            if ntype == "transaction":
+                tx_feat = full_g.nodes["transaction"].data["feat"][src_nids].to(device)
+                h["transaction"] = self.tx_proj(tx_feat)
+            else:
+                h[ntype] = self.emb[ntype](src_nids.to(device))
+        return h
+
+    def forward(self, blocks, full_g: dgl.DGLHeteroGraph) -> torch.Tensor:
+        """
+        blocks: list of sampled blocks, one per layer
+        returns logits for DST transaction nodes of final block (seed nodes)
+        """
+        h = self._input_features_for_block(blocks[0], full_g)
+
+        for l in range(self.num_layers):
+            block = blocks[l]
+            out = {}
+
+            # Iterate actual relations present in this sampled block
+            for (s, r, d) in block.canonical_etypes:
+                if block.num_edges((s, r, d)) == 0:
+                    continue
+
+                key = f"{s}__{r}__{d}"
+                conv = self.rel_convs[l][key]
+
+                # For bipartite conv on blocks: dst nodes are a prefix of src nodes
+                dst_count = block.num_dst_nodes(d)
+                h_dst = h[d][:dst_count]
+                h_src = h[s]
+
+                rel_g = block[(s, r, d)]
+                msg = conv(rel_g, (h_src, h_dst))
+
+                out[d] = msg if d not in out else (out[d] + msg)
+
+            # If for any reason dst type had no incoming edges, keep its dst features
+            # (Prevents KeyError and allows training to proceed robustly.)
+            for d in block.dsttypes:
+                if d not in out and d in h:
+                    dst_count = block.num_dst_nodes(d)
+                    out[d] = h[d][:dst_count]
+
+            # Nonlinearity + dropout
+            for ntype in out:
+                out[ntype] = self.dropout(F.relu(out[ntype]))
+
+            h = out  # now h contains features for DST nodes of this layer
+
+        if "transaction" not in h:
+            raise RuntimeError(
+                "After message passing, 'transaction' is missing. "
+                "This indicates the sampled block had no transaction dst nodes."
+            )
+
+        return self.cls(h["transaction"])
+
+    """
     Neighbor-sampling friendly hetero GNN:
 
     - transaction: numeric features -> linear proj -> hidden
@@ -434,7 +552,7 @@ def make_dataloaders(g_cpu, train_mask, val_mask, fanouts, batch_size, num_worke
         sampler,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=False,
+        drop_last=False,HeteroSAGEBlockClassifier
         num_workers=num_workers,
         device="cpu",
     )
