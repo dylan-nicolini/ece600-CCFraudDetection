@@ -423,7 +423,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
 
     # 50/50 time split
     order = torch.argsort(g.nodes["transaction"].data["time_raw"])
-    split = num_tx // 2
+    split = int(num_tx * 0.7)
     train_ids = order[:split]
     val_ids = order[split:]
 
