@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-ieee_option4_heterosage_comet_sampling.py
+ieee_option4_heterosage_comet_sampling_fixed.py
 
 IEEE-CIS Option 4 heterogeneous graph + neighbor sampling + Comet logging.
 
-Why this version?
-- Your DGL build's HGTConv requires (ntype, etype) tensors (older API),
-  which is awkward for true heterographs + blocks.
-- This implementation uses heterograph-native message passing:
-    dgl.nn.HeteroGraphConv with per-relation SAGEConv modules
-  which is stable across DGL versions and works with neighbor sampling.
+This version is HARDENED for older DGL builds by:
+- Avoiding HGTConv (API mismatches)
+- Avoiding HeteroGraphConv (module key mismatches / silent skips on older DGL)
+- Implementing MANUAL per-relation SAGEConv over sampled hetero blocks
+- Forcing IN-neighbor sampling (critical for entity -> transaction graphs)
 
 ZIP input must contain:
   - train_transaction.csv
@@ -26,27 +25,17 @@ Graph Option 4:
     - screen     (id_33)
     - product    (ProductCD)
 
-Edge types (entity -> transaction):
+Edges (entity -> transaction):
   ("card",    "made",   "transaction")
   ("address", "at",     "transaction")
   ("device",  "used",   "transaction")
   ("browser", "ua",     "transaction")
   ("os",      "os",     "transaction")
   ("screen",  "screen", "transaction")
-  ("product", "type",   "transaction")
+  ("product", "ptype",  "transaction")   # renamed from "type" to avoid ModuleDict collisions
 
 Split:
-  50/50 time-based split on TransactionDT (sorted ascending):
-    first half -> train, second half -> val
-
-Training:
-  - Neighbor sampling via MultiLayerNeighborSampler
-  - Seed nodes are transaction nodes
-  - Predict labels for seed transaction nodes
-  - Log AP, AUC, F1 + confusion matrix; Comet optional
-
-Chunked ZIP reading FIX:
-  - zread_csv() keeps the ZIP member stream open for iterator lifetime.
+  50/50 time-based split on TransactionDT (sorted ascending)
 """
 
 import argparse
@@ -98,18 +87,21 @@ def try_create_comet_experiment(enabled: bool, project: str, workspace: str, tag
     except Exception as e:
         return None, f"failed to create comet experiment: {e}"
 
+
+# -----------------------------
+# Force IN-neighbor sampling
+# -----------------------------
 class InNeighborSampler(MultiLayerNeighborSampler):
     """
-    Forces in-neighbor sampling for each layer.
+    Forces IN-neighbor sampling.
 
-    This is critical when your graph is directed (entity -> transaction) and
-    you seed 'transaction' nodes. If the sampler uses out-neighbors, you'll
-    get empty blocks and no 'transaction' outputs.
+    Your graph is directed entity -> transaction.
+    If sampling uses out-neighbors from transaction seeds, you get empty blocks.
     """
     def sample_frontier(self, block_id, g, seed_nodes):
         fanout = self.fanouts[block_id]
-        # Sample IN-neighbors explicitly
         return dgl.sampling.sample_neighbors(g, seed_nodes, fanout, edge_dir="in")
+
 
 # -----------------------------
 # Helpers: incremental mapping
@@ -166,19 +158,18 @@ def zread_csv(zf: zipfile.ZipFile, name: str, usecols=None, chunksize=None):
 
 
 # -----------------------------
-# Model: HeteroGraphConv + SAGEConv (block-friendly)
+# Model: Manual hetero SAGE over blocks
 # -----------------------------
 class HeteroSAGEBlockClassifier(nn.Module):
     """
     Manual hetero message passing over blocks (compatible with older DGL).
 
-    We avoid dgl.nn.HeteroGraphConv because older versions require special keys
-    and can silently skip relations, resulting in missing 'transaction' output.
-
     For each layer:
-      For each canonical etype (src, rel, dst) in the sampled block:
-        out[dst] += SAGEConv(block[etype], (h_src, h_dst))
+      For each canonical etype (src, rel, dst) present in the sampled block:
+        out[dst] += SAGEConv(block[(src,rel,dst)], (h_src, h_dst))
       h := relu(dropout(out))
+
+    Returns logits for DST transaction nodes of final block (seed nodes).
     """
     def __init__(self, full_g: dgl.DGLHeteroGraph, tx_in_dim: int, hidden_dim=64, num_layers=2, dropout=0.2):
         super().__init__()
@@ -187,30 +178,26 @@ class HeteroSAGEBlockClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.ntypes = full_g.ntypes
-        self.canonical_etypes = full_g.canonical_etypes  # list of (src, rel, dst)
+        self.canonical_etypes = list(full_g.canonical_etypes)  # list of (src, rel, dst)
 
         # Transaction feature projection
         self.tx_proj = nn.Linear(tx_in_dim, hidden_dim)
 
-        # Entity embeddings (ID-only baseline)
+        # Entity embeddings (baseline)
         self.emb = nn.ModuleDict()
         for ntype in self.ntypes:
             if ntype == "transaction":
                 continue
             self.emb[ntype] = nn.Embedding(full_g.num_nodes(ntype), hidden_dim)
 
-        # Per-layer, per-relation conv modules, keyed by a SAFE string
-        # Key format: "src__rel__dst" (all strings, avoids ModuleDict tuple errors)
+        # Per-layer, per-relation conv modules keyed by safe string
+        # Key format: "src__rel__dst"
         self.rel_convs = nn.ModuleList()
         for _ in range(num_layers):
             md = nn.ModuleDict()
             for (s, r, d) in self.canonical_etypes:
                 key = f"{s}__{r}__{d}"
-                md[key] = dgl.nn.SAGEConv(
-                    in_feats=hidden_dim,
-                    out_feats=hidden_dim,
-                    aggregator_type="mean"
-                )
+                md[key] = dgl.nn.SAGEConv(hidden_dim, hidden_dim, "mean")
             self.rel_convs.append(md)
 
         self.cls = nn.Sequential(
@@ -238,17 +225,13 @@ class HeteroSAGEBlockClassifier(nn.Module):
         return h
 
     def forward(self, blocks, full_g: dgl.DGLHeteroGraph) -> torch.Tensor:
-        """
-        blocks: list of sampled blocks, one per layer
-        returns logits for DST transaction nodes of final block (seed nodes)
-        """
         h = self._input_features_for_block(blocks[0], full_g)
 
         for l in range(self.num_layers):
             block = blocks[l]
             out = {}
 
-            # Iterate actual relations present in this sampled block
+            # Apply each relation conv present in this block
             for (s, r, d) in block.canonical_etypes:
                 if block.num_edges((s, r, d)) == 0:
                     continue
@@ -256,119 +239,42 @@ class HeteroSAGEBlockClassifier(nn.Module):
                 key = f"{s}__{r}__{d}"
                 conv = self.rel_convs[l][key]
 
-                # For bipartite conv on blocks: dst nodes are a prefix of src nodes
+                # In DGL blocks: dst nodes are a prefix of src nodes for each ntype
                 dst_count = block.num_dst_nodes(d)
-                h_dst = h[d][:dst_count]
+
+                # Some older DGL builds may omit a type from h if it never appears as a source;
+                # skip safely if missing.
+                if s not in h or d not in h:
+                    continue
+
                 h_src = h[s]
+                h_dst = h[d][:dst_count]
 
                 rel_g = block[(s, r, d)]
                 msg = conv(rel_g, (h_src, h_dst))
-
                 out[d] = msg if d not in out else (out[d] + msg)
 
-            # If for any reason dst type had no incoming edges, keep its dst features
-            # (Prevents KeyError and allows training to proceed robustly.)
+            # Carry forward any dst types that got no messages this layer
             for d in block.dsttypes:
                 if d not in out and d in h:
                     dst_count = block.num_dst_nodes(d)
                     out[d] = h[d][:dst_count]
 
-            # Nonlinearity + dropout
+            # Activate + dropout
             for ntype in out:
                 out[ntype] = self.dropout(F.relu(out[ntype]))
 
-            h = out  # now h contains features for DST nodes of this layer
+            h = out
 
+        # HARD fallback: if transaction is still missing, directly project dst transaction feats
         if "transaction" not in h:
-            raise RuntimeError(
-                "After message passing, 'transaction' is missing. "
-                "This indicates the sampled block had no transaction dst nodes."
-            )
+            last_block = blocks[-1]
+            if "transaction" not in last_block.dsttypes:
+                raise RuntimeError("Sampled batch has no transaction dst nodes. Check sampler/seed nodes.")
+            dst_tx_nids = last_block.dstnodes["transaction"].data[dgl.NID]
+            tx_feat = full_g.nodes["transaction"].data["feat"][dst_tx_nids].to(last_block.device)
+            h["transaction"] = self.tx_proj(tx_feat)
 
-        return self.cls(h["transaction"])
-
-
-
-    """
-    Neighbor-sampling friendly hetero GNN:
-
-    - transaction: numeric features -> linear proj -> hidden
-    - entities: ID embedding -> hidden
-    - message passing: HeteroGraphConv with per-relation SAGEConv
-    - classifier: MLP on transaction embeddings at final (seed) layer
-    """
-    def __init__(self, full_g: dgl.DGLHeteroGraph, tx_in_dim: int, hidden_dim=64, num_layers=2, dropout=0.2):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.dropout = nn.Dropout(dropout)
-
-        self.ntypes = full_g.ntypes
-        # NOTE: older DGL expects string keys in HeteroGraphConv mods dict
-        self.etypes = full_g.etypes  # e.g. ["made","at","used","ua","os","screen","type"]
-
-
-        # Transaction feature projection
-        self.tx_proj = nn.Linear(tx_in_dim, hidden_dim)
-
-        # Entity embeddings
-        self.emb = nn.ModuleDict()
-        for ntype in self.ntypes:
-            if ntype == "transaction":
-                continue
-            self.emb[ntype] = nn.Embedding(full_g.num_nodes(ntype), hidden_dim)
-
-        # Per-layer hetero conv
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            rel_convs = {}
-            for etype in self.etypes:
-                rel_convs[etype] = dgl.nn.SAGEConv(
-                    in_feats=hidden_dim,
-                    out_feats=hidden_dim,
-                    aggregator_type="mean"
-                )
-            self.layers.append(dgl.nn.HeteroGraphConv(rel_convs, aggregate="sum"))
-
-        self.cls = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),
-        )
-
-    def _input_features_for_block(self, block: dgl.DGLHeteroGraph, full_g: dgl.DGLHeteroGraph) -> dict:
-        """
-        Build input features for SRC nodes of the first block.
-
-        In blocks: block.srcnodes[ntype].data[dgl.NID] gives original IDs in full graph.
-        """
-        h = {}
-        device = block.device
-
-        for ntype in block.srctypes:
-            src_nids = block.srcnodes[ntype].data[dgl.NID]
-            if ntype == "transaction":
-                tx_feat = full_g.nodes["transaction"].data["feat"][src_nids].to(device)
-                h["transaction"] = self.tx_proj(tx_feat)
-            else:
-                h[ntype] = self.emb[ntype](src_nids.to(device))
-        return h
-
-    def forward(self, blocks, full_g: dgl.DGLHeteroGraph) -> torch.Tensor:
-        """
-        blocks: list of sampled blocks (len == num_layers)
-        returns logits for DST transaction nodes of last block (seed nodes)
-        """
-        h = self._input_features_for_block(blocks[0], full_g)
-
-        for l in range(self.num_layers):
-            block = blocks[l]
-            h = self.layers[l](block, h)  # returns features for DST nodes of this block
-            for ntype in h:
-                h[ntype] = self.dropout(F.relu(h[ntype]))
-
-        # After final layer, h["transaction"] corresponds to DST transaction nodes (seeds)
         return self.cls(h["transaction"])
 
 
@@ -385,7 +291,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
     ]
     id_cols = ["TransactionID", "id_30", "id_31", "id_33", "DeviceType", "DeviceInfo"]
 
-    # Load identity into dict (fits in memory)
+    # Load identity to dict
     id_df = zread_csv(zf, "train_identity.csv", usecols=id_cols, chunksize=None)
     id_df = id_df.set_index("TransactionID")
     id_dict = id_df.to_dict(orient="index")
@@ -435,7 +341,6 @@ def build_graph(zip_path: str, chunksize: int = 200000):
                 di = safe_str(ident.get("DeviceInfo", "__MISSING__"))
                 dt = safe_str(ident.get("DeviceType", "__MISSING__"))
                 device_key = di if di != "__MISSING__" else f"DeviceType={dt}"
-
                 browser_key = safe_str(ident.get("id_31", "__MISSING__"))
                 os_key = safe_str(ident.get("id_30", "__MISSING__"))
                 screen_key = safe_str(ident.get("id_33", "__MISSING__"))
@@ -481,8 +386,10 @@ def build_graph(zip_path: str, chunksize: int = 200000):
 
     data_dict = {}
     for etype, (srcs, dsts) in edges.items():
-        data_dict[etype] = (torch.tensor(srcs, dtype=torch.int64),
-                            torch.tensor(dsts, dtype=torch.int64))
+        data_dict[etype] = (
+            torch.tensor(srcs, dtype=torch.int64),
+            torch.tensor(dsts, dtype=torch.int64),
+        )
 
     g = dgl.heterograph(
         data_dict,
@@ -495,10 +402,10 @@ def build_graph(zip_path: str, chunksize: int = 200000):
             "os": len(os_map),
             "screen": len(screen_map),
             "product": len(product_map),
-        }
+        },
     )
 
-    # Tx features (starter)
+    # Transaction features
     tx_time = np.asarray(tx_time, dtype=np.float32)
     tx_amt = np.asarray(tx_amt, dtype=np.float32)
     tx_dist1 = np.asarray(tx_dist1, dtype=np.float32)
@@ -527,7 +434,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
 
     meta = {
         "graph_option": "option4",
-        "model": "hetero_sage",
+        "model": "manual_hetero_sage",
         "split": "50/50_time",
         "num_tx": int(num_tx),
         "num_nodes": {ntype: int(g.num_nodes(ntype)) for ntype in g.ntypes},
@@ -631,7 +538,10 @@ def train(
     train_loader, val_loader = make_dataloaders(g_cpu, train_mask, val_mask, fanouts, batch_size, num_workers=num_workers)
 
     tx_feat_dim = int(g_cpu.nodes["transaction"].data["feat"].shape[1])
-    model = HeteroSAGEBlockClassifier(g_cpu, tx_in_dim=tx_feat_dim, hidden_dim=hidden_dim, num_layers=len(fanouts)).to(device)
+    model = HeteroSAGEBlockClassifier(
+        g_cpu, tx_in_dim=tx_feat_dim, hidden_dim=hidden_dim, num_layers=len(fanouts)
+    ).to(device)
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # class weights
@@ -647,7 +557,7 @@ def train(
     if comet_exp is not None:
         comet_exp.log_parameters({
             "graph_option": "option4",
-            "model": "hetero_sage",
+            "model": "manual_hetero_sage",
             "split": "50/50_time",
             "fanouts": str(list(fanouts)),
             "batch_size": int(batch_size),
@@ -715,7 +625,6 @@ def train(
                 "val_f1": float(val_metrics["f1"]),
             }, step=ep)
 
-            # Confusion matrix
             try:
                 comet_exp.log_confusion_matrix(
                     y_true=val_metrics["y_true"].tolist(),
@@ -770,12 +679,11 @@ def main():
 
     ap.add_argument("--dump-meta", default="", help="Optional JSON path to write graph metadata")
 
-    # Comet
     ap.add_argument("--comet", action="store_true", help="Enable Comet logging")
     ap.add_argument("--comet-project", default=os.getenv("COMET_PROJECT_NAME", "fraud-gnn"))
     ap.add_argument("--comet-workspace", default=os.getenv("COMET_WORKSPACE", ""))
     ap.add_argument("--comet-name", default="", help="Experiment name (optional)")
-    ap.add_argument("--comet-tags", default="ieee,option4,heterosage,neighbor_sampling", help="Comma-separated tags")
+    ap.add_argument("--comet-tags", default="ieee,option4,manual_heterosage,neighbor_sampling", help="Comma-separated tags")
 
     args = ap.parse_args()
 
