@@ -273,7 +273,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
         ("browser", "ua", "transaction"): ([], []),
         ("os", "os", "transaction"): ([], []),
         ("screen", "screen", "transaction"): ([], []),
-        ("product", "type", "transaction"): ([], []),
+        ("product", "ptype", "transaction"): ([], []),  # renamed from "type"
     }
 
     tx_time, tx_amt, tx_dist1, tx_dist2, tx_labels = [], [], [], [], []
@@ -334,8 +334,8 @@ def build_graph(zip_path: str, chunksize: int = 200000):
             edges[("screen", "screen", "transaction")][0].append(sc_id)
             edges[("screen", "screen", "transaction")][1].append(tx_index)
 
-            edges[("product", "type", "transaction")][0].append(pr_id)
-            edges[("product", "type", "transaction")][1].append(tx_index)
+            edges[("product", "ptype", "transaction")][0].append(pr_id)
+            edges[("product", "ptype", "transaction")][1].append(tx_index)
 
             tx_time.append(tdt)
             tx_amt.append(amt)
