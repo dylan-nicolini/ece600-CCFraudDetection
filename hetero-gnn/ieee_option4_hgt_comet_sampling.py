@@ -9,31 +9,46 @@ ZIP input must contain:
   - train_identity.csv
 
 Graph Option 4:
-  Node types: transaction, card, address, device, browser, os, screen, product
+  Node types:
+    - transaction (labeled)
+    - card       (card1..card6 combined key)
+    - address    (addr1|addr2 combined key)
+    - device     (DeviceInfo preferred; fallback DeviceType)
+    - browser    (id_31)
+    - os         (id_30)
+    - screen     (id_33)
+    - product    (ProductCD)
+
   Edge types (entity -> transaction):
-    card-made->transaction
-    address-at->transaction
-    device-used->transaction
-    browser-ua->transaction
-    os-os->transaction
-    screen-screen->transaction
-    product-type->transaction
+    ("card",    "made",   "transaction")
+    ("address", "at",     "transaction")
+    ("device",  "used",   "transaction")
+    ("browser", "ua",     "transaction")
+    ("os",      "os",     "transaction")
+    ("screen",  "screen", "transaction")
+    ("product", "type",   "transaction")
 
 Split:
-  50/50 time-based split on TransactionDT
+  50/50 time-based split on TransactionDT (sorted ascending):
+    first half -> train
+    second half -> val
 
 Training:
-  - Neighbor sampling with MultiLayerNeighborSampler
+  - Neighbor sampling via MultiLayerNeighborSampler
   - Seed nodes are transaction nodes
-  - Predict labels for seed transaction nodes
-  - Logs AP, AUC, F1 and confusion matrix to Comet
+  - Predict fraud probability for seed transaction nodes
+  - Logs AP, AUC, F1 and confusion matrix
+
+IMPORTANT FIX:
+  Chunked reading from ZIP requires keeping the ZIP member stream open for the iterator lifetime.
+  This file uses a safe zread_csv() that returns a generator that holds the stream open.
 """
 
 import argparse
+import io
 import json
 import os
 import zipfile
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -50,8 +65,12 @@ from sklearn.metrics import average_precision_score, roc_auc_score, f1_score, co
 # Optional Comet import
 # -----------------------------
 def try_create_comet_experiment(enabled: bool, project: str, workspace: str, tags: list, name: str):
+    """
+    Returns (experiment_or_None, reason_string)
+    """
     if not enabled:
         return None, "comet disabled"
+
     try:
         from comet_ml import Experiment  # type: ignore
     except Exception as e:
@@ -83,6 +102,7 @@ def try_create_comet_experiment(enabled: bool, project: str, workspace: str, tag
 # Helpers: incremental mapping
 # -----------------------------
 class IdMapper:
+    """Incremental mapping from arbitrary keys to contiguous int IDs."""
     def __init__(self):
         self.map = {}
         self.next_id = 0
@@ -106,8 +126,32 @@ def safe_str(x) -> str:
 
 
 def zread_csv(zf: zipfile.ZipFile, name: str, usecols=None, chunksize=None):
-    with zf.open(name) as f:
-        return pd.read_csv(f, usecols=usecols, chunksize=chunksize)
+    """
+    Safe ZIP CSV reader.
+
+    - If chunksize is None: returns a DataFrame (eager read) and closes the stream.
+    - If chunksize is set: returns an iterator that yields DataFrame chunks while keeping
+      the ZIP stream open until iteration completes.
+
+    This avoids: ValueError: I/O operation on closed file.
+    """
+    zstream = zf.open(name)  # DO NOT use 'with' here when chunking
+    text = io.TextIOWrapper(zstream, encoding="utf-8", newline="")
+
+    if chunksize is None:
+        try:
+            return pd.read_csv(text, usecols=usecols)
+        finally:
+            text.close()
+
+    def _iter():
+        try:
+            for chunk in pd.read_csv(text, usecols=usecols, chunksize=chunksize):
+                yield chunk
+        finally:
+            text.close()
+
+    return _iter()
 
 
 # -----------------------------
@@ -118,32 +162,34 @@ class HGTBlockClassifier(nn.Module):
     HGTConv over sampled blocks.
 
     - transaction nodes: numeric features projected to hidden_dim
-    - other node types: embedding lookup by node ID
+    - other node types: embedding lookup by original node ID
     """
     def __init__(self, full_g: dgl.DGLHeteroGraph, tx_in_dim: int, hidden_dim=64, num_heads=4, num_layers=2, dropout=0.2):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        # Canonical ntypes/etypes based on full graph
         self.ntypes = full_g.ntypes
         self.etypes = full_g.canonical_etypes
 
         if not hasattr(dgl.nn, "HGTConv"):
-            raise RuntimeError("dgl.nn.HGTConv not found. Upgrade DGL or use R-GCN.")
+            raise RuntimeError("dgl.nn.HGTConv not found. Upgrade DGL or use an R-GCN model.")
 
+        # Maps for HGTConv
         self.ntype2id = {n: i for i, n in enumerate(self.ntypes)}
         self.etype2id = {e: i for i, e in enumerate(self.etypes)}
 
+        # Transaction numeric feature projection
         self.tx_proj = nn.Linear(tx_in_dim, hidden_dim)
 
-        # Embeddings for entity node types
+        # Entity embeddings (ID-only to start)
         self.emb = nn.ModuleDict()
         for ntype in self.ntypes:
             if ntype == "transaction":
                 continue
             self.emb[ntype] = nn.Embedding(full_g.num_nodes(ntype), hidden_dim)
 
+        # HGT layers
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
             self.layers.append(
@@ -159,6 +205,8 @@ class HGTBlockClassifier(nn.Module):
             )
 
         self.dropout = nn.Dropout(dropout)
+
+        # Classifier on transaction dst embeddings (seed nodes)
         self.cls = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -169,13 +217,15 @@ class HGTBlockClassifier(nn.Module):
     def _input_features_for_block(self, block: dgl.DGLHeteroGraph, full_g: dgl.DGLHeteroGraph) -> dict:
         """
         Build input feature dict for a block's SRC nodes.
-        DGL blocks store original node IDs in block.srcnodes[ntype].data[dgl.NID]
+
+        DGL blocks store original node IDs in:
+          block.srcnodes[ntype].data[dgl.NID]
         """
         h = {}
         device = block.device
 
         for ntype in block.srctypes:
-            src_nids = block.srcnodes[ntype].data[dgl.NID]  # original node IDs
+            src_nids = block.srcnodes[ntype].data[dgl.NID]  # original node IDs in full graph
             if ntype == "transaction":
                 tx_feat = full_g.nodes["transaction"].data["feat"][src_nids].to(device)
                 h["transaction"] = self.tx_proj(tx_feat)
@@ -184,10 +234,11 @@ class HGTBlockClassifier(nn.Module):
 
         return h
 
-    def forward(self, blocks, full_g: dgl.DGLHeteroGraph):
+    def forward(self, blocks, full_g: dgl.DGLHeteroGraph) -> torch.Tensor:
         """
         blocks: list of hetero blocks, one per layer
-        returns logits for DST transaction nodes of the last block (seed nodes)
+
+        Returns logits for the DST 'transaction' nodes of the final block (seed nodes).
         """
         h = self._input_features_for_block(blocks[0], full_g)
 
@@ -197,10 +248,8 @@ class HGTBlockClassifier(nn.Module):
             for ntype in h:
                 h[ntype] = self.dropout(F.relu(h[ntype]))
 
-        # On the final block, h contains features for DST nodes (the seeds) of that block
         tx_dst_h = h["transaction"]
-        logits = self.cls(tx_dst_h)
-        return logits
+        return self.cls(tx_dst_h)
 
 
 # -----------------------------
@@ -209,6 +258,7 @@ class HGTBlockClassifier(nn.Module):
 def build_graph(zip_path: str, chunksize: int = 200000):
     zf = zipfile.ZipFile(zip_path)
 
+    # Columns we use (starter set)
     tx_cols = [
         "TransactionID", "isFraud", "TransactionDT", "TransactionAmt",
         "ProductCD", "card1", "card2", "card3", "card4", "card5", "card6",
@@ -216,12 +266,12 @@ def build_graph(zip_path: str, chunksize: int = 200000):
     ]
     id_cols = ["TransactionID", "id_30", "id_31", "id_33", "DeviceType", "DeviceInfo"]
 
-    # identity table fits in memory (~144k rows)
+    # Identity table (~144k rows) is fine to load in memory
     id_df = zread_csv(zf, "train_identity.csv", usecols=id_cols, chunksize=None)
     id_df = id_df.set_index("TransactionID")
     id_dict = id_df.to_dict(orient="index")
 
-    # mappers
+    # Mappers for each entity type
     card_map = IdMapper()
     addr_map = IdMapper()
     device_map = IdMapper()
@@ -230,6 +280,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
     screen_map = IdMapper()
     product_map = IdMapper()
 
+    # Edge lists: entity -> transaction
     edges = {
         ("card", "made", "transaction"): ([], []),
         ("address", "at", "transaction"): ([], []),
@@ -240,9 +291,12 @@ def build_graph(zip_path: str, chunksize: int = 200000):
         ("product", "type", "transaction"): ([], []),
     }
 
+    # Transaction arrays
     tx_time, tx_amt, tx_dist1, tx_dist2, tx_labels = [], [], [], [], []
+
     tx_index = 0
 
+    # Stream transactions from zip
     for chunk in zread_csv(zf, "train_transaction.csv", usecols=tx_cols, chunksize=chunksize):
         for row in chunk.itertuples(index=False):
             tid = int(row[0])
@@ -251,19 +305,26 @@ def build_graph(zip_path: str, chunksize: int = 200000):
             amt = float(row[3])
             prod = safe_str(row[4])
 
+            # Card composite key
             card_key = "|".join(safe_str(x) for x in row[5:11])
+
+            # Address composite key
             addr_key = f"{safe_str(row[11])}|{safe_str(row[12])}"
 
+            # Distances (fill missing with 0)
             d1 = 0.0 if pd.isna(row[13]) else float(row[13])
             d2 = 0.0 if pd.isna(row[14]) else float(row[14])
 
+            # Identity lookup (may not exist)
             ident = id_dict.get(tid, None)
+
             if ident is None:
                 device_key = "__NO_IDENTITY__"
                 browser_key = "__NO_IDENTITY__"
                 os_key = "__NO_IDENTITY__"
                 screen_key = "__NO_IDENTITY__"
             else:
+                # Device: prefer DeviceInfo, fallback DeviceType
                 di = safe_str(ident.get("DeviceInfo", "__MISSING__"))
                 dt = safe_str(ident.get("DeviceType", "__MISSING__"))
                 device_key = di if di != "__MISSING__" else f"DeviceType={dt}"
@@ -272,7 +333,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
                 os_key = safe_str(ident.get("id_30", "__MISSING__"))
                 screen_key = safe_str(ident.get("id_33", "__MISSING__"))
 
-            # map to IDs
+            # Map to node IDs
             card_id = card_map.get(card_key)
             addr_id = addr_map.get(addr_key)
             dev_id = device_map.get(device_key)
@@ -281,7 +342,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
             sc_id = screen_map.get(screen_key)
             pr_id = product_map.get(prod)
 
-            # add edges entity -> tx
+            # Add edges entity -> tx
             edges[("card", "made", "transaction")][0].append(card_id)
             edges[("card", "made", "transaction")][1].append(tx_index)
 
@@ -303,6 +364,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
             edges[("product", "type", "transaction")][0].append(pr_id)
             edges[("product", "type", "transaction")][1].append(tx_index)
 
+            # Collect tx feats + labels
             tx_time.append(tdt)
             tx_amt.append(amt)
             tx_dist1.append(d1)
@@ -313,6 +375,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
 
     num_tx = tx_index
 
+    # Build DGL heterograph
     data_dict = {}
     for etype, (srcs, dsts) in edges.items():
         data_dict[etype] = (torch.tensor(srcs, dtype=torch.int64),
@@ -332,7 +395,7 @@ def build_graph(zip_path: str, chunksize: int = 200000):
         }
     )
 
-    # transaction features (simple starter set)
+    # Transaction feature matrix: normalize columns
     tx_time = np.asarray(tx_time, dtype=np.float32)
     tx_amt = np.asarray(tx_amt, dtype=np.float32)
     tx_dist1 = np.asarray(tx_dist1, dtype=np.float32)
@@ -361,11 +424,13 @@ def build_graph(zip_path: str, chunksize: int = 200000):
 
     meta = {
         "graph_option": "option4",
+        "split": "50/50_time",
         "num_tx": int(num_tx),
         "num_nodes": {ntype: int(g.num_nodes(ntype)) for ntype in g.ntypes},
         "edge_counts": {str(etype): int(g.num_edges(etype)) for etype in g.canonical_etypes},
         "tx_feat_dim": int(g.nodes["transaction"].data["feat"].shape[1]),
-        "split": "50/50_time",
+        "chunksize": int(chunksize),
+        "zip_path": os.path.basename(zip_path),
     }
 
     return g, train_mask, val_mask, meta
@@ -389,7 +454,7 @@ def make_dataloaders(g, train_mask, val_mask, fanouts, batch_size, num_workers=0
         shuffle=True,
         drop_last=False,
         num_workers=num_workers,
-        device="cpu",  # keep sampling on CPU, move blocks to GPU in training loop
+        device="cpu",  # sample on CPU; blocks moved to device in loop
     )
 
     val_loader = DataLoader(
@@ -407,24 +472,28 @@ def make_dataloaders(g, train_mask, val_mask, fanouts, batch_size, num_workers=0
 
 
 # -----------------------------
-# Train / Eval with metrics
+# Eval helpers
 # -----------------------------
 @torch.no_grad()
-def evaluate_epoch(model, full_g, loader, device):
+def evaluate_epoch(model, full_g_cpu, full_g_device, loader, device):
+    """
+    Returns dict with ap/auc/f1/cm and arrays for Comet confusion matrix logging.
+    - full_g_cpu: graph on CPU (used for node-id iteration if needed)
+    - full_g_device: graph moved to device (used for tensor indexing on GPU/CPU device)
+    """
     model.eval()
 
     y_true_all = []
     y_prob_all = []
     y_pred_all = []
 
-    for input_nodes, output_nodes, blocks in loader:
+    for _, output_nodes, blocks in loader:
         blocks = [b.to(device) for b in blocks]
 
-        # seed transaction node IDs (original graph IDs)
-        seed_tx = output_nodes["transaction"]
-        labels = full_g.nodes["transaction"].data["label"][seed_tx].to(device)
+        seed_tx = output_nodes["transaction"]  # original node IDs
+        labels = full_g_device.nodes["transaction"].data["label"][seed_tx]
 
-        logits = model(blocks, full_g.to(device))
+        logits = model(blocks, full_g_device)
         probs = F.softmax(logits, dim=1)[:, 1]
 
         y_true = labels.detach().cpu().numpy()
@@ -439,7 +508,6 @@ def evaluate_epoch(model, full_g, loader, device):
     y_prob_all = np.concatenate(y_prob_all) if y_prob_all else np.array([], dtype=np.float64)
     y_pred_all = np.concatenate(y_pred_all) if y_pred_all else np.array([], dtype=np.int64)
 
-    # Robust guards for degenerate splits (rare)
     if len(np.unique(y_true_all)) < 2:
         auc = float("nan")
         ap = float("nan")
@@ -450,11 +518,21 @@ def evaluate_epoch(model, full_g, loader, device):
     f1 = float(f1_score(y_true_all, y_pred_all, zero_division=0))
     cm = confusion_matrix(y_true_all, y_pred_all, labels=[0, 1]).tolist()
 
-    return {"ap": ap, "auc": auc, "f1": f1, "cm": cm, "y_true": y_true_all, "y_pred": y_pred_all}
+    return {
+        "ap": ap,
+        "auc": auc,
+        "f1": f1,
+        "cm": cm,
+        "y_true": y_true_all,
+        "y_pred": y_pred_all,
+    }
 
 
+# -----------------------------
+# Train loop
+# -----------------------------
 def train(
-    g,
+    g_cpu,
     train_mask,
     val_mask,
     fanouts,
@@ -463,59 +541,59 @@ def train(
     epochs=10,
     hidden_dim=64,
     lr=2e-3,
+    num_workers=0,
     comet_exp=None,
 ):
-    # Full graph stays as source of features/labels; blocks carry structure for each batch
-    full_g = g  # keep on CPU for sampler; we'll move tensors as needed
+    # Build loaders from CPU graph (sampler runs on CPU)
+    train_loader, val_loader = make_dataloaders(g_cpu, train_mask, val_mask, fanouts, batch_size, num_workers=num_workers)
 
-    train_loader, val_loader = make_dataloaders(full_g, train_mask, val_mask, fanouts, batch_size)
-
-    tx_feat_dim = full_g.nodes["transaction"].data["feat"].shape[1]
-    model = HGTBlockClassifier(full_g, tx_in_dim=tx_feat_dim, hidden_dim=hidden_dim).to(device)
+    tx_feat_dim = int(g_cpu.nodes["transaction"].data["feat"].shape[1])
+    model = HGTBlockClassifier(g_cpu, tx_in_dim=tx_feat_dim, hidden_dim=hidden_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # Imbalance-aware class weights from train set
-    y_train = full_g.nodes["transaction"].data["label"][train_mask]
+    # Class weights from train set (imbalanced fraud)
+    y_train = g_cpu.nodes["transaction"].data["label"][train_mask]
     pos = int((y_train == 1).sum().item())
     neg = int((y_train == 0).sum().item())
     w1 = (neg / (pos + 1e-6)) if pos > 0 else 1.0
     class_w = torch.tensor([1.0, float(w1)], dtype=torch.float32, device=device)
 
+    # Move full graph tensors to device for fast indexing
+    g_device = g_cpu.to(device)
+
     if comet_exp is not None:
         comet_exp.log_parameters({
             "graph_option": "option4",
             "split": "50/50_time",
-            "fanouts": str(fanouts),
-            "batch_size": batch_size,
-            "hidden_dim": hidden_dim,
-            "epochs": epochs,
-            "lr": lr,
+            "fanouts": str(list(fanouts)),
+            "batch_size": int(batch_size),
+            "hidden_dim": int(hidden_dim),
+            "epochs": int(epochs),
+            "lr": float(lr),
             "device": device,
             "tx_feat_dim": int(tx_feat_dim),
-            "pos_train": pos,
-            "neg_train": neg,
+            "pos_train": int(pos),
+            "neg_train": int(neg),
             "pos_weight_class1": float(w1),
+            "num_workers": int(num_workers),
         })
 
     best_val_ap = -1.0
     best_state = None
     best_epoch = -1
 
-    # Move full_g feature tensors to device once (for fast indexing)
-    # Note: DGL graph structure used by sampler remains on CPU.
-    full_g_device = full_g.to(device)
-
     for ep in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
         n_batches = 0
 
-        for input_nodes, output_nodes, blocks in train_loader:
+        for _, output_nodes, blocks in train_loader:
             blocks = [b.to(device) for b in blocks]
-            seed_tx = output_nodes["transaction"]
-            labels = full_g_device.nodes["transaction"].data["label"][seed_tx]
 
-            logits = model(blocks, full_g_device)
+            seed_tx = output_nodes["transaction"]
+            labels = g_device.nodes["transaction"].data["label"][seed_tx]
+
+            logits = model(blocks, g_device)
             loss = F.cross_entropy(logits, labels, weight=class_w)
 
             opt.zero_grad()
@@ -528,9 +606,9 @@ def train(
 
         avg_loss = total_loss / max(n_batches, 1)
 
-        # Evaluate train/val (metrics + confusion matrix)
-        train_metrics = evaluate_epoch(model, full_g, train_loader, device)
-        val_metrics = evaluate_epoch(model, full_g, val_loader, device)
+        # Evaluate train/val
+        train_metrics = evaluate_epoch(model, g_cpu, g_device, train_loader, device)
+        val_metrics = evaluate_epoch(model, g_cpu, g_device, val_loader, device)
 
         # Track best by val AP
         if not np.isnan(val_metrics["ap"]) and val_metrics["ap"] > best_val_ap:
@@ -538,7 +616,7 @@ def train(
             best_epoch = ep
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        # Console output
+        # Console
         print(
             f"epoch {ep:03d} | loss={avg_loss:.4f} "
             f"| train AP={train_metrics['ap']:.4f} AUC={train_metrics['auc']:.4f} F1={train_metrics['f1']:.4f} "
@@ -550,15 +628,15 @@ def train(
         if comet_exp is not None:
             comet_exp.log_metrics({
                 "loss": avg_loss,
-                "train_ap": train_metrics["ap"],
-                "train_auc": train_metrics["auc"],
-                "train_f1": train_metrics["f1"],
-                "val_ap": val_metrics["ap"],
-                "val_auc": val_metrics["auc"],
-                "val_f1": val_metrics["f1"],
+                "train_ap": float(train_metrics["ap"]),
+                "train_auc": float(train_metrics["auc"]),
+                "train_f1": float(train_metrics["f1"]),
+                "val_ap": float(val_metrics["ap"]),
+                "val_auc": float(val_metrics["auc"]),
+                "val_f1": float(val_metrics["f1"]),
             }, step=ep)
 
-            # Log confusion matrix (Comet-native if available)
+            # Confusion matrix to Comet
             try:
                 comet_exp.log_confusion_matrix(
                     y_true=val_metrics["y_true"].tolist(),
@@ -567,14 +645,13 @@ def train(
                     step=ep
                 )
             except Exception:
-                # fallback: log as text
                 comet_exp.log_text(json.dumps({"val_confusion_matrix": val_metrics["cm"]}), step=ep)
 
     # Reload best
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    final_val = evaluate_epoch(model, full_g, val_loader, device)
+    final_val = evaluate_epoch(model, g_cpu, g_device, val_loader, device)
     print(f"\nBEST val AP={best_val_ap:.4f} at epoch {best_epoch}")
     print(f"FINAL val (reloaded): AP={final_val['ap']:.4f} AUC={final_val['auc']:.4f} F1={final_val['f1']:.4f} CM={final_val['cm']}")
 
@@ -592,12 +669,14 @@ def train(
             pass
 
 
+# -----------------------------
+# CLI
+# -----------------------------
 def parse_fanouts(s: str):
-    # e.g. "15,10" -> [15,10]
     parts = [p.strip() for p in s.split(",") if p.strip()]
     fanouts = [int(p) for p in parts]
     if len(fanouts) < 1:
-        raise ValueError("fanouts must have at least 1 layer")
+        raise ValueError("fanouts must contain at least one integer, e.g. '15,10'")
     return fanouts
 
 
@@ -613,6 +692,7 @@ def main():
     # Neighbor sampling
     ap.add_argument("--fanouts", default="15,10", help="Comma-separated fanouts per layer, e.g. '15,10'")
     ap.add_argument("--batch-size", type=int, default=4096)
+    ap.add_argument("--num-workers", type=int, default=0, help="Dataloader workers (0 is safest)")
 
     ap.add_argument("--dump-meta", default="", help="Optional JSON path to write graph metadata")
 
@@ -659,12 +739,16 @@ def main():
     if comet_exp is not None:
         comet_exp.log_parameters({
             "zip_path": os.path.basename(args.zip_path),
-            "chunksize": args.chunksize,
+            "chunksize": int(args.chunksize),
         })
-        comet_exp.log_text(json.dumps(meta, indent=2), metadata={"type": "graph_meta"})
+        # log graph meta
+        try:
+            comet_exp.log_text(json.dumps(meta, indent=2), metadata={"type": "graph_meta"})
+        except Exception:
+            pass
 
     train(
-        g=g,
+        g_cpu=g,
         train_mask=train_mask,
         val_mask=val_mask,
         fanouts=fanouts,
@@ -673,6 +757,7 @@ def main():
         epochs=args.epochs,
         hidden_dim=args.hidden_dim,
         lr=args.lr,
+        num_workers=args.num_workers,
         comet_exp=comet_exp
     )
 
