@@ -278,7 +278,15 @@ def build_graph_sffsd(csv_path: str, train_ratio: float = 0.7):
     # Tx arrays
     tx_time = df[colmap["time"]].to_numpy(dtype=np.float32)
     tx_amt = df[colmap["amount"]].to_numpy(dtype=np.float32)
-    tx_lbl = df[colmap["labels"]].to_numpy(dtype=np.int64)
+    raw_lbl = pd.to_numeric(df[colmap["labels"]], errors="coerce").fillna(0).astype(np.int64)
+
+    # Map: 1 = fraud, everything else (0 or 2) = legit
+    # This implements your assumption: 2 means suspicious but NOT fraud
+    tx_lbl = (raw_lbl == 1).astype(np.int64).to_numpy()
+
+    # Optional sanity print
+    vals, cnts = np.unique(tx_lbl, return_counts=True)
+    print("Binary label distribution:", dict(zip(vals.tolist(), cnts.tolist())))
 
     # Build entities + edges
     for tx_id, (s, t, loc, ty) in enumerate(
