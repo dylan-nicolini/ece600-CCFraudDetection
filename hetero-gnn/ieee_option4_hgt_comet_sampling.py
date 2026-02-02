@@ -244,7 +244,11 @@ class HGTBlockClassifier(nn.Module):
 
         for l, layer in enumerate(self.layers):
             block = blocks[l]
-            h = layer(block, h, ntype_id_map=self.ntype2id, etype_id_map=self.etype2id)
+            try:
+                h = layer(block, h, ntype_id_map=self.ntype2id, etype_id_map=self.etype2id)
+            except TypeError:
+                # Older DGL HGTConv API
+                h = layer(block, h)
             for ntype in h:
                 h[ntype] = self.dropout(F.relu(h[ntype]))
 
