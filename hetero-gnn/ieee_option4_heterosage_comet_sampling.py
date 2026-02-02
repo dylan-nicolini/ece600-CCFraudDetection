@@ -478,6 +478,9 @@ def make_dataloaders(g_cpu, train_mask, val_mask, fanouts, batch_size, num_worke
         device="cpu",
     )
 
+    print("Train batches per epoch:", len(train_loader))
+    print("Val batches:", len(val_loader))
+
     return train_loader, val_loader
 
 
