@@ -275,6 +275,8 @@ class HeteroSAGEBlockClassifier(nn.Module):
 
         return self.cls(h["transaction"])
 
+
+
     """
     Neighbor-sampling friendly hetero GNN:
 
@@ -552,7 +554,7 @@ def make_dataloaders(g_cpu, train_mask, val_mask, fanouts, batch_size, num_worke
         sampler,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=False,HeteroSAGEBlockClassifier
+        drop_last=False,
         num_workers=num_workers,
         device="cpu",
     )
