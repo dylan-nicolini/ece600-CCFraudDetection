@@ -172,7 +172,9 @@ class HeteroSAGEBlockClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.ntypes = full_g.ntypes
-        self.canonical_etypes = full_g.canonical_etypes
+        # NOTE: older DGL expects string keys in HeteroGraphConv mods dict
+        self.etypes = full_g.etypes  # e.g. ["made","at","used","ua","os","screen","type"]
+
 
         # Transaction feature projection
         self.tx_proj = nn.Linear(tx_in_dim, hidden_dim)
@@ -188,9 +190,8 @@ class HeteroSAGEBlockClassifier(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
             rel_convs = {}
-            for canonical_etype in self.canonical_etypes:
-                # SAGEConv works for bipartite relations in heterographs/blocks
-                rel_convs[canonical_etype] = dgl.nn.SAGEConv(
+            for etype in self.etypes:
+                rel_convs[etype] = dgl.nn.SAGEConv(
                     in_feats=hidden_dim,
                     out_feats=hidden_dim,
                     aggregator_type="mean"
