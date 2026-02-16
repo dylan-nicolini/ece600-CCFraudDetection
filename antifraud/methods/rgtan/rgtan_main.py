@@ -482,7 +482,6 @@ def run_rgtan(
     y_test_s[y_test_s == 2] = 0
 
     # ================= FULL METRIC DEBUG =================
-    import numpy as np
     from sklearn.metrics import confusion_matrix, precision_score, recall_score
 
     print("\n================ FULL METRIC DEBUG ================", flush=True)
