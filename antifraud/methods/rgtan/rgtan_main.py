@@ -4,6 +4,7 @@ import zipfile
 import pickle
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_integer_dtype
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -160,7 +161,7 @@ def run_rgtan(
         ref_df = feat_df[cat_features].copy()
         for c in cat_features:
             col = ref_df[c]
-            if not np.issubdtype(col.dtype, np.integer):
+            if not is_integer_dtype(col):
                 codes, _ = pd.factorize(col, sort=True)
                 ref_df[c] = codes.astype("int64")
             if ref_df[c].isna().any():
