@@ -480,6 +480,81 @@ def run_rgtan(
     y_test_s = y_test.copy()
     y_test_s[y_test_s == 2] = 0
 
+    # ================= FULL METRIC DEBUG =================
+    import numpy as np
+    from sklearn.metrics import confusion_matrix, precision_score, recall_score
+
+    print("\n================ FULL METRIC DEBUG ================", flush=True)
+
+    # ---- Labels ----
+    try:
+        ys = np.asarray(y_test_s)
+        print("y_test_s shape:", ys.shape, flush=True)
+        print("y_test_s distribution:", np.unique(ys, return_counts=True), flush=True)
+    except Exception as e:
+        print("y_test_s ERROR:", repr(e), flush=True)
+
+    # ---- Scores ----
+    try:
+        ts = test_scores
+        if hasattr(ts, "detach"):
+            ts = ts.detach().cpu().numpy()
+        ts = np.asarray(ts)
+
+        print("test_scores shape:", ts.shape, flush=True)
+        print("test_scores min/mean/max:",
+            float(np.min(ts)),
+            float(np.mean(ts)),
+            float(np.max(ts)),
+            flush=True)
+    except Exception as e:
+        print("test_scores ERROR:", repr(e), flush=True)
+
+    # ---- Predictions ----
+    try:
+        tp = np.asarray(test_pred)
+        print("test_pred shape:", tp.shape, flush=True)
+        print("test_pred distribution:", np.unique(tp, return_counts=True), flush=True)
+    except Exception as e:
+        print("test_pred ERROR:", repr(e), flush=True)
+
+    # ---- Confusion Matrix ----
+    try:
+        cm = confusion_matrix(ys, tp)
+        print("\nConfusion Matrix:\n", cm, flush=True)
+
+        if cm.shape == (2, 2):
+            tn, fp, fn, tpv = cm.ravel()
+            print(f"TN={tn}, FP={fp}, FN={fn}, TP={tpv}", flush=True)
+    except Exception as e:
+        print("confusion_matrix ERROR:", repr(e), flush=True)
+
+    # ---- Precision / Recall ----
+    try:
+        prec = precision_score(ys, tp, zero_division=0)
+        rec = recall_score(ys, tp, zero_division=0)
+        print("Precision:", prec, flush=True)
+        print("Recall:", rec, flush=True)
+    except Exception as e:
+        print("precision/recall ERROR:", repr(e), flush=True)
+
+    # ---- Threshold Sweep ----
+    try:
+        print("\nThreshold Sweep:", flush=True)
+        for t in [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]:
+            yp = (ts >= t).astype(int)
+            f1_tmp = 0.0
+            try:
+                from sklearn.metrics import f1_score
+                f1_tmp = f1_score(ys, yp, zero_division=0)
+            except:
+                pass
+            print(f"  t={t:.2f}  preds={yp.sum()}  F1={f1_tmp:.4f}", flush=True)
+    except Exception as e:
+        print("threshold sweep ERROR:", repr(e), flush=True)
+
+    print("===================================================\n", flush=True)
+
     test_auc = _safe_auc(y_test_s, test_scores)
     try:
         test_f1 = float(f1_score(y_test_s, test_pred))
@@ -516,29 +591,70 @@ def loda_rgtan_data(dataset: str, test_size: float, ieee_mode: str = "auto"):
     """
     # --- S-FFSD
     if dataset == "S-FFSD":
-        mat = loadmat("./data/S-FFSD/S-FFSD.mat")
-        data = mat["data"]
-        labels = data[:, -1].astype(int)
-        feat_data = data[:, :-1]
-        feat_data = pd.DataFrame(feat_data, columns=["Source", "Target", "Amount", "Location", "Time", "Type"])
+        # Match ORIGINAL GTAN S-FFSD pipeline exactly:
+        # - Load S-FFSDneofull.csv
+        # - Filter Labels <= 2
+        # - Build graph by grouping on Source/Target/Location/Type and linking neighbors by Time
+        # - Label-encode Source/Target/Location/Type
+        # - Stratified split with random_state=2 and test_size=test_size/2
 
-        # label encode categorical columns
-        le = LabelEncoder()
-        for c in ["Source", "Target", "Location", "Type"]:
-            feat_data[c] = le.fit_transform(feat_data[c].astype(str))
+        prefix = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+        sffsd_path = os.path.join(prefix, "S-FFSDneofull.csv")
 
-        labels = pd.Series(labels)
-        train_idx, test_idx = train_test_split(
-            np.arange(len(feat_data)),
-            test_size=test_size,
-            random_state=2023,
-            stratify=labels.values,
+        df = pd.read_csv(sffsd_path)
+        df = df.loc[:, ~df.columns.str.contains("Unnamed")]
+        data = df[df["Labels"] <= 2].reset_index(drop=True)
+
+        # --- Build graph (ORIGINAL logic)
+        alls, allt = [], []
+        pair = ["Source", "Target", "Location", "Type"]
+        edge_per_trans = 3
+
+        for column in pair:
+            src, tgt = [], []
+            for _, c_df in data.groupby(column):
+                c_df = c_df.sort_values(by="Time")
+                df_len = len(c_df)
+                sorted_idxs = c_df.index.tolist()
+
+                # Connect each transaction to itself + next neighbors (edge_per_trans)
+                src.extend(
+                    [sorted_idxs[i] for i in range(df_len) for j in range(edge_per_trans) if i + j < df_len]
+                )
+                tgt.extend(
+                    [sorted_idxs[i + j] for i in range(df_len) for j in range(edge_per_trans) if i + j < df_len]
+                )
+
+            alls.extend(src)
+            allt.extend(tgt)
+
+        g = dgl.graph((np.array(alls), np.array(allt)))
+
+        # --- Encode categoricals (ORIGINAL logic)
+        for col in ["Source", "Target", "Location", "Type"]:
+            le = LabelEncoder()
+            data[col] = le.fit_transform(data[col].apply(str).values)
+
+        labels = data["Labels"].astype(int)
+        feat_data = data.drop("Labels", axis=1)
+
+        # --- Split (ORIGINAL logic)
+        index = list(range(len(labels)))
+        train_idx, test_idx, _, _ = train_test_split(
+            index,
+            labels,
+            stratify=labels,
+            test_size=test_size / 2,
+            random_state=2,
+            shuffle=True,
         )
-        g = gen_graph(feat_data, edge_per_trans=3)
+
+        # IMPORTANT: match original cat_features list
         cat_features = ["Target", "Location", "Type"]
         neigh_features = {}
 
         return feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features
+
 
     # --- IEEE
     if dataset == "IEEE":

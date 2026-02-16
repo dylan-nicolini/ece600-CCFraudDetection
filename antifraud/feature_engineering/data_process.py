@@ -18,8 +18,7 @@ from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 # from . import *
-DATADIR = os.path.join(os.path.dirname(
-    os.path.abspath(__file__)), "..", "data/")
+DATADIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data/")
 
 
 def featmap_gen(tmp_df=None):
